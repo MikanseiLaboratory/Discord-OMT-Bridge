@@ -1,0 +1,49 @@
+[[permission]]
+identifier = "allow-load-settings"
+description = "Load bridge settings."
+commands.allow = ["load_settings"]
+
+[[permission]]
+identifier = "allow-save-settings"
+description = "Save bridge settings."
+commands.allow = ["save_settings"]
+
+[[permission]]
+identifier = "allow-connect"
+description = "Connect the user gateway."
+commands.allow = ["connect"]
+
+[[permission]]
+identifier = "allow-disconnect"
+description = "Disconnect the user gateway."
+commands.allow = ["disconnect"]
+
+[[permission]]
+identifier = "allow-join-voice"
+description = "Join a voice channel."
+commands.allow = ["join_voice"]
+
+[[permission]]
+identifier = "allow-leave-voice"
+description = "Leave the voice channel."
+commands.allow = ["leave_voice"]
+
+[[permission]]
+identifier = "allow-set-voice-flags"
+description = "Update mute and deafen."
+commands.allow = ["set_voice_flags"]
+
+[[permission]]
+identifier = "allow-assign-slot"
+description = "Pin a user feed to a persistent LAN slot."
+commands.allow = ["assign_slot"]
+
+[[permission]]
+identifier = "allow-clear-slot"
+description = "Clear a persistent LAN slot assignment."
+commands.allow = ["clear_slot"]
+
+[[permission]]
+identifier = "allow-snapshot"
+description = "Read the bridge snapshot."
+commands.allow = ["snapshot"]

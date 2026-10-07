@@ -1,0 +1,18 @@
+{
+  "identifier": "default",
+  "description": "Main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-load-settings",
+    "allow-save-settings",
+    "allow-connect",
+    "allow-disconnect",
+    "allow-join-voice",
+    "allow-leave-voice",
+    "allow-assign-slot",
+    "allow-clear-slot",
+    "allow-set-voice-flags",
+    "allow-snapshot"
+  ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+ndi = ["dep:grafton-ndi"]
+
+[dependencies]
+grafton-ndi = { workspace = true, optional = true }
+openmediatransport = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "colorbar"
+path = "src/bin/colorbar.rs"

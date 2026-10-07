@@ -1,0 +1,44 @@
+# Copy to config.toml. The user token is read from the DISCORD_TOKEN environment
+# variable and is never stored in this file.
+#
+# Using a user token to join voice violates Discord's Terms of Service and can
+# result in account termination. Use a dedicated account.
+
+guild_id = "000000000000000000"
+channel_id = "000000000000000000"
+
+# More voice channels joined at the same time. Each entry is one seat.
+# [[channels]]
+# guild_id = "000000000000000000"
+# channel_id = "000000000000000000"
+
+# Join muted. Deaf would hide remote audio, so leave it false when capturing.
+self_mute = true
+self_deaf = false
+
+# NDI requires the NDI 6 SDK and a build with `--features ndi`.
+enable_omt = true
+enable_ndi = false
+
+source_prefix = "Discord"
+
+# Empty allow list means every user except those in deny_user_ids.
+allow_user_ids = []
+deny_user_ids = []
+
+# Maximum simultaneous Go Live watches.
+max_streams = 8
+# Receive transceivers allocated for remote video SSRCs.
+max_video_slots = 8
+# Persistent LAN senders. Created at connect and kept when a camera or Go Live stops.
+audio_slots = 8
+camera_slots = 8
+golive_slots = 4
+# Preferred simulcast quality (0-100). Higher means a larger layer.
+prefer_quality = 100
+# Seconds without media before a slot is shown as idle. The sender stays open.
+idle_timeout_secs = 5
+
+# Override Discord's desktop client build number when Identify is rejected.
+# Leave at 0 to fetch the current stable Windows build at startup.
+client_build_number = 0
