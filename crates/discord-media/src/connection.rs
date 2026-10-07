@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -73,8 +73,19 @@ pub enum MediaEvent {
     },
 }
 
+/// Newest decoded picture. Older frames are replaced, so a slow output cannot
+/// leave the preview stuck on an image from seconds ago.
+#[derive(Clone)]
+pub struct VideoPicture {
+    pub user_id: u64,
+    pub bgra: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct MediaHandle {
     pub events: mpsc::Receiver<MediaEvent>,
+    pub pictures: watch::Receiver<Option<VideoPicture>>,
     pub cancel: CancellationToken,
 }
 
@@ -103,9 +114,10 @@ impl SsrcBook {
 pub fn spawn_media(params: ConnectParams) -> MediaHandle {
     let cancel = CancellationToken::new();
     let (tx, events) = mpsc::channel(128);
+    let (pictures_tx, pictures) = watch::channel(None);
     let child_cancel = cancel.clone();
     tokio::spawn(async move {
-        if let Err(err) = run_connection(params, tx.clone(), child_cancel).await {
+        if let Err(err) = run_connection(params, tx.clone(), pictures_tx, child_cancel).await {
             tracing::warn!(%err, "media connection ended");
             let _ = tx
                 .send(MediaEvent::Disconnected {
@@ -114,12 +126,13 @@ pub fn spawn_media(params: ConnectParams) -> MediaHandle {
                 .await;
         }
     });
-    MediaHandle { events, cancel }
+    MediaHandle { events, pictures, cancel }
 }
 
 async fn run_connection(
     params: ConnectParams,
     events: mpsc::Sender<MediaEvent>,
+    pictures: watch::Sender<Option<VideoPicture>>,
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
     let endpoint = params.endpoint.trim_end_matches('/').trim_start_matches("wss://");
@@ -130,8 +143,10 @@ async fn run_connection(
         .map_err(|err| MediaError::Voice(err.to_string()))?;
 
     let (rtp_tx, mut rtp_rx) = mpsc::channel::<(RTPCodecType, webrtc::rtp::packet::Packet)>(2048);
-    let video_jobs = spawn_video_decoder(events.clone());
+    let video_jobs = spawn_video_decoder(pictures.clone());
     let mut wait_for_keyframe = false;
+    let mut request_pli = false;
+    let mut video_rtp = 0u32;
     let peer = prepare_peer(params.max_video_slots, rtp_tx).await?;
     let (failed_tx, mut failed_rx) = mpsc::channel::<()>(1);
     peer.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
@@ -176,8 +191,6 @@ async fn run_connection(
     let mut answer_deadline: Option<Instant> = None;
     let mut local_audio_ssrc = 0u32;
     let mut video_announce: Option<String> = None;
-    let mut video_rtp = 0u32;
-    let mut video_wait: Option<Instant> = None;
     let mut answer_tick = interval(Duration::from_millis(200));
     answer_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -195,9 +208,17 @@ async fn run_connection(
                 }
                 if answered {
                     keyframe_requests = keyframe_requests.saturating_add(1);
-                    if keyframe_requests % 5 == 0 {
+                    // Refreshing this every second keeps the layer. Doing it on every
+                    // tick makes the sender restart and drop resolution.
+                    if keyframe_requests == 1 || keyframe_requests % 5 == 0 || request_pli {
                         let wants = sink_wants(params.prefer_quality, &video_streams);
                         socket.send(Message::Text(wants.to_string().into())).await?;
+                    }
+                    // A PLI every second, after video is already flowing, forces
+                    // intra frames and the sender scales the picture down.
+                    let ask_keyframe = request_pli || keyframe_requests <= 3 || (video_rtp == 0 && keyframe_requests % 5 == 0);
+                    if ask_keyframe {
+                        request_pli = false;
                         for stream in &video_streams {
                             if stream.ssrc == 0 {
                                 continue;
@@ -210,16 +231,6 @@ async fn run_connection(
                         }
                         if keyframe_requests <= 20 {
                             tracing::info!(streams = video_streams.len(), "requested video keyframe");
-                        }
-                    }
-                    if params.kind == MediaKind::GoLive
-                        && video_rtp == 0
-                        && video_streams.iter().any(|stream| stream.ssrc != 0)
-                    {
-                        if video_wait.is_none() {
-                            video_wait = Some(Instant::now());
-                        } else if video_wait.is_some_and(|start| start.elapsed() > Duration::from_secs(4)) {
-                            return Err(MediaError::Voice("Go Live video RTP did not arrive".into()));
                         }
                     }
                 }
@@ -426,10 +437,6 @@ async fn run_connection(
                     marker: header.marker,
                     payload_type: header.payload_type,
                 };
-                if kind == RTPCodecType::Video {
-                    video_rtp = video_rtp.saturating_add(1);
-                    video_wait = None;
-                }
                 if rtx_payloads.contains(&item.payload_type) || book.rtx.contains(&header.ssrc) {
                     continue;
                 }
@@ -452,8 +459,11 @@ async fn run_connection(
                         &mut av1_frames,
                         h264_payload,
                         &events,
+                        &pictures,
                         &video_jobs,
                         &mut wait_for_keyframe,
+                        &mut request_pli,
+                        &mut video_rtp,
                     ).await;
                 }
             }
@@ -475,8 +485,11 @@ async fn dispatch_rtp(
     av1_frames: &mut HashMap<u32, Av1Assembler>,
     _h264_payload: u8,
     events: &mpsc::Sender<MediaEvent>,
+    pictures: &watch::Sender<Option<VideoPicture>>,
     video_jobs: &mpsc::Sender<VideoJob>,
     wait_for_keyframe: &mut bool,
+    request_pli: &mut bool,
+    video_rtp: &mut u32,
 ) {
     let Some(user_id) = (if kind == RTPCodecType::Audio {
         book.audio.get(&ssrc).copied()
@@ -512,6 +525,7 @@ async fn dispatch_rtp(
         }
         return;
     }
+    *video_rtp = video_rtp.saturating_add(1);
     note_packet("video", packet.payload_type, packet.payload.len());
     if rtx_like(packet.payload_type) || packet.payload.is_empty() {
         return;
@@ -527,10 +541,11 @@ async fn dispatch_rtp(
             Err(err) => {
                 note_reject("video decrypt", format!("{err} bytes={}", access_unit.len()));
                 *wait_for_keyframe = true;
+                *request_pli = true;
                 return;
             }
         };
-        queue_video(video_jobs, wait_for_keyframe, user_id, plain);
+        queue_video(video_jobs, wait_for_keyframe, user_id, plain).await;
         return;
     }
     let piece = if matches!(packet.payload_type, 103 | 105 | 125) {
@@ -568,14 +583,12 @@ async fn dispatch_rtp(
             } else {
                 note_decoded("video black");
             }
-            let _ = events
-                .send(MediaEvent::Video {
-                    user_id,
-                    bgra,
-                    width,
-                    height,
-                })
-                .await;
+            let _ = pictures.send(Some(VideoPicture {
+                user_id,
+                bgra: Arc::<[u8]>::from(bgra),
+                width,
+                height,
+            }));
         }
         Ok(None) => {}
         Err(err) => note_reject(if packet.payload_type == 101 { "av1 decode" } else { "h264 decode" }, err),
@@ -608,7 +621,7 @@ fn av1_sequence_header(frame: &[u8]) -> bool {
     frame.first().is_some_and(|byte| (byte >> 3) & 0x0f == 1)
 }
 
-fn queue_video(jobs: &mpsc::Sender<VideoJob>, wait_for_keyframe: &mut bool, user_id: u64, plain: Vec<u8>) {
+async fn queue_video(jobs: &mpsc::Sender<VideoJob>, wait_for_keyframe: &mut bool, user_id: u64, plain: Vec<u8>) {
     let key = av1_sequence_header(&plain);
     if *wait_for_keyframe && !key {
         return;
@@ -618,14 +631,15 @@ fn queue_video(jobs: &mpsc::Sender<VideoJob>, wait_for_keyframe: &mut bool, user
         plain,
         reset: *wait_for_keyframe,
     };
-    match jobs.try_send(job) {
-        Ok(()) => *wait_for_keyframe = false,
-        Err(_) => *wait_for_keyframe = true,
+    // Decode in order. Dropping a delta freezes the picture until the next
+    // keyframe, which is what made Go Live look stuck on an old frame.
+    if jobs.send(job).await.is_ok() {
+        *wait_for_keyframe = false;
     }
 }
 
-fn spawn_video_decoder(events: mpsc::Sender<MediaEvent>) -> mpsc::Sender<VideoJob> {
-    let (tx, mut rx) = mpsc::channel::<VideoJob>(8);
+fn spawn_video_decoder(pictures: watch::Sender<Option<VideoPicture>>) -> mpsc::Sender<VideoJob> {
+    let (tx, mut rx) = mpsc::channel::<VideoJob>(4);
     tokio::spawn(async move {
         let Ok(mut decoder) = Av1Decoder::new() else {
             tracing::warn!("av1 decoder unavailable");
@@ -645,14 +659,12 @@ fn spawn_video_decoder(events: mpsc::Sender<MediaEvent>) -> mpsc::Sender<VideoJo
                     } else {
                         note_decoded("video black");
                     }
-                    let _ = events
-                        .send(MediaEvent::Video {
-                            user_id: job.user_id,
-                            bgra,
-                            width,
-                            height,
-                        })
-                        .await;
+                    let _ = pictures.send(Some(VideoPicture {
+                        user_id: job.user_id,
+                        bgra: Arc::<[u8]>::from(bgra),
+                        width,
+                        height,
+                    }));
                 }
                 Ok(None) => {}
                 Err(err) => {

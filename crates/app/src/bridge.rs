@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use discord_media::{spawn_media, ConnectParams, MediaEvent, MediaHandle, MediaKind};
+use discord_media::{spawn_media, ConnectParams, MediaEvent, MediaHandle, MediaKind, VideoPicture};
 use discord_user_gateway::{
     spawn_gateway, ChannelRecord, GatewayCommand, GatewayEvent, GuildRecord, StreamEndpoint, VoiceEndpoint,
 };
@@ -434,6 +434,22 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
             }
             event = bus_rx.recv() => {
                 let Some(event) = event else { break };
+                let mut pending = vec![event];
+                let mut index = 0;
+                while index < pending.len() {
+                    if bus_is_video(&pending[index]) {
+                        while let Ok(next) = bus_rx.try_recv() {
+                            if bus_is_video(&next) {
+                                pending[index] = next;
+                            } else {
+                                pending.push(next);
+                                break;
+                            }
+                        }
+                    }
+                    index += 1;
+                }
+                for event in pending {
                 match event {
                     Bus::Gateway(event) => {
                         handle_gateway(
@@ -496,10 +512,31 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         apply_media(&session.config, &mut router, self_id, channel_id, MediaKind::GoLive, &event);
                     }
                 }
+                }
             }
         }
     }
     Ok(())
+}
+
+fn bus_is_video(event: &Bus) -> bool {
+    match event {
+        Bus::Voice { event: MediaEvent::Video { .. }, .. } | Bus::Stream { event: MediaEvent::Video { .. }, .. } => true,
+        _ => false,
+    }
+}
+
+fn latest_video(events: &mut mpsc::Receiver<MediaEvent>, mut event: MediaEvent) -> (MediaEvent, Option<MediaEvent>) {
+    if !matches!(event, MediaEvent::Video { .. }) {
+        return (event, None);
+    }
+    loop {
+        match events.try_recv() {
+            Ok(newer @ MediaEvent::Video { .. }) => event = newer,
+            Ok(other) => return (event, Some(other)),
+            Err(_) => return (event, None),
+        }
+    }
 }
 
 fn consider_autojoin(world: &World, media: &mut MediaState) {
@@ -1065,9 +1102,60 @@ enum VoiceRoute {
 
 fn forward_media(handle: MediaHandle, bus_tx: mpsc::Sender<Bus>, route: VoiceRoute) -> MediaHandle {
     let cancel = handle.cancel.clone();
+    let task_cancel = cancel.clone();
     let mut events = handle.events;
+    let mut pictures = handle.pictures;
     tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
+        let mut deferred = None;
+        loop {
+            let event = if let Some(event) = deferred.take() {
+                event
+            } else {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    event = events.recv() => {
+                        match event {
+                            Some(event) => event,
+                            None => break,
+                        }
+                    }
+                    changed = pictures.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let Some(picture) = pictures.borrow_and_update().clone() else {
+                            continue;
+                        };
+                        picture_event(picture)
+                    }
+                }
+            };
+            let (mut event, next) = latest_video(&mut events, event);
+            deferred = next;
+            if matches!(event, MediaEvent::Video { .. }) {
+                event = newest_picture(event, &mut pictures);
+                // Do not queue a second full frame while the bridge is still
+                // publishing. The watch already holds the newest one.
+                while bus_tx.max_capacity().saturating_sub(bus_tx.capacity()) > 8 {
+                    tokio::select! {
+                        _ = task_cancel.cancelled() => return,
+                        changed = pictures.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            if let Some(picture) = pictures.borrow_and_update().clone() {
+                                event = picture_event(picture);
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                            if bus_tx.max_capacity().saturating_sub(bus_tx.capacity()) <= 8 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                event = newest_picture(event, &mut pictures);
+            }
             let message = match &route {
                 VoiceRoute::Channel(channel_id) => Bus::Voice {
                     channel_id: *channel_id,
@@ -1083,11 +1171,40 @@ fn forward_media(handle: MediaHandle, bus_tx: mpsc::Sender<Bus>, route: VoiceRou
             }
         }
     });
-    MediaHandle { events: idle_receiver(), cancel }
+    MediaHandle {
+        events: idle_receiver(),
+        pictures: idle_pictures(),
+        cancel,
+    }
+}
+
+fn newest_picture(event: MediaEvent, pictures: &mut watch::Receiver<Option<VideoPicture>>) -> MediaEvent {
+    if !matches!(event, MediaEvent::Video { .. }) {
+        return event;
+    }
+    if pictures.has_changed().unwrap_or(false) {
+        if let Some(picture) = pictures.borrow_and_update().clone() {
+            return picture_event(picture);
+        }
+    }
+    event
+}
+
+fn picture_event(picture: VideoPicture) -> MediaEvent {
+    MediaEvent::Video {
+        user_id: picture.user_id,
+        bgra: picture.bgra.to_vec(),
+        width: picture.width,
+        height: picture.height,
+    }
 }
 
 fn idle_receiver() -> mpsc::Receiver<MediaEvent> {
     mpsc::channel(1).1
+}
+
+fn idle_pictures() -> watch::Receiver<Option<VideoPicture>> {
+    watch::channel(None).1
 }
 
 fn apply_media(

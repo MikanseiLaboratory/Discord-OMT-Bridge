@@ -4,7 +4,7 @@ mod decode;
 mod jitter;
 mod sdp;
 
-pub use connection::{spawn_media, ConnectParams, MediaEvent, MediaHandle, MediaKind};
+pub use connection::{spawn_media, ConnectParams, MediaEvent, MediaHandle, MediaKind, VideoPicture};
 pub use sdp::{advertisements_from_offer, select_protocol_fragment, synthesize_answer};
 
 use thiserror::Error;

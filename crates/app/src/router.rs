@@ -213,6 +213,7 @@ impl SourceRouter {
         if !config.allows(user_id) {
             return;
         }
+        note_video_size(kind.slug(), width, height);
         self.remember_preview(user_id, kind, bgra, width, height);
         let feed = FeedKey { channel_id, user_id, kind };
         for index in self.indexes_for(feed) {
@@ -427,7 +428,7 @@ impl SourceRouter {
                 return;
             }
         }
-        let (width, height, rgba) = downscale_bgra_to_rgba(bgra, width, height, 960);
+        let (width, height, rgba) = downscale_bgra_to_rgba(bgra, width, height, 1920);
         if rgba.is_empty() {
             return;
         }
@@ -534,6 +535,24 @@ pub fn log_sources(snapshots: &[SlotSnapshot]) {
             "output"
         );
     }
+}
+
+fn note_video_size(kind: &'static str, width: u32, height: u32) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Vec<(&'static str, Instant)>> = Mutex::new(Vec::new());
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if let Some(slot) = last.iter_mut().find(|(name, _)| *name == kind) {
+        if slot.1.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        slot.1 = Instant::now();
+    } else {
+        last.push((kind, Instant::now()));
+    }
+    drop(last);
+    tracing::info!(kind, width, height, "video frame");
 }
 
 fn downscale_bgra_to_rgba(bgra: &[u8], width: u32, height: u32, max_width: u32) -> (u32, u32, Vec<u8>) {
