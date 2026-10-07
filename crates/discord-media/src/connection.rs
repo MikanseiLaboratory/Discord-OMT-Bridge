@@ -147,12 +147,18 @@ async fn run_connection(
     let mut wait_for_keyframe = false;
     let mut request_pli = false;
     let mut video_rtp = 0u32;
-    let peer = prepare_peer(params.max_video_slots, rtp_tx).await?;
+    let peer = prepare_peer(4, params.max_video_slots, rtp_tx).await?;
     let (failed_tx, mut failed_rx) = mpsc::channel::<()>(1);
+    let peer_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_flag = peer_ready.clone();
     peer.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         let failed_notify = failed_tx.clone();
+        let ready_flag = ready_flag.clone();
         Box::pin(async move {
             tracing::info!(?state, "peer connection state");
+            if state == RTCPeerConnectionState::Connected {
+                ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if state == RTCPeerConnectionState::Failed {
                 let _ = failed_notify.try_send(());
             }
@@ -193,6 +199,8 @@ async fn run_connection(
     let mut video_announce: Option<String> = None;
     let mut answer_tick = interval(Duration::from_millis(200));
     answer_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut video_since: Option<Instant> = None;
+    let mut resubscribed = false;
 
     loop {
         tokio::select! {
@@ -208,29 +216,51 @@ async fn run_connection(
                 }
                 if answered {
                     keyframe_requests = keyframe_requests.saturating_add(1);
-                    // Refreshing this every second keeps the layer. Doing it on every
-                    // tick makes the sender restart and drop resolution.
-                    if keyframe_requests == 1 || keyframe_requests % 5 == 0 || request_pli {
-                        let wants = sink_wants(params.prefer_quality, &video_streams);
+                    let ready = peer_ready.load(std::sync::atomic::Ordering::Relaxed);
+                    // A PLI sent before SRTP is up uses an invalid sender SSRC and
+                    // Discord sometimes stops forwarding video while leaving audio up.
+                    if ready && video_since.is_none() {
+                        video_since = Some(Instant::now());
+                        request_pli = true;
+                    }
+                    let missing_video = params.kind == MediaKind::GoLive
+                        && video_rtp == 0
+                        && video_streams.iter().any(|stream| stream.ssrc != 0);
+                    if missing_video {
+                        if let Some(start) = video_since {
+                            if !resubscribed && start.elapsed() >= Duration::from_secs(2) {
+                                resubscribed = true;
+                                request_pli = true;
+                                tracing::info!("resubscribing Go Live video");
+                            }
+                        }
+                    }
+                    if ready && (request_pli || keyframe_requests == 1 || keyframe_requests % 5 == 0) {
+                        // While the picture is missing, quality 0 on the audio SSRC
+                        // stops the audio-only forward so the video SSRC is sent.
+                        let mute = if resubscribed && video_rtp == 0 { &audio_streams[..] } else { &[] };
+                        let wants = sink_wants(params.prefer_quality, &video_streams, mute);
                         socket.send(Message::Text(wants.to_string().into())).await?;
                     }
-                    // A PLI every second, after video is already flowing, forces
-                    // intra frames and the sender scales the picture down.
-                    let ask_keyframe = request_pli || keyframe_requests <= 3 || (video_rtp == 0 && keyframe_requests % 5 == 0);
+                    // After video is flowing, a PLI every second forces intra frames
+                    // and the sender scales the picture down.
+                    let ask_keyframe = ready
+                        && (request_pli || keyframe_requests <= 3 || (video_rtp == 0 && keyframe_requests % 5 == 0));
                     if ask_keyframe {
                         request_pli = false;
+                        let sender_ssrc = local_audio_ssrc.max(1);
                         for stream in &video_streams {
                             if stream.ssrc == 0 {
                                 continue;
                             }
                             let pli = PictureLossIndication {
-                                sender_ssrc: 1,
+                                sender_ssrc,
                                 media_ssrc: stream.ssrc,
                             };
                             let _ = peer.write_rtcp(&[Box::new(pli)]).await;
                         }
-                        if keyframe_requests <= 20 {
-                            tracing::info!(streams = video_streams.len(), "requested video keyframe");
+                        if keyframe_requests <= 20 || (resubscribed && video_rtp == 0) {
+                            tracing::info!(streams = video_streams.len(), sender_ssrc, "requested video keyframe");
                         }
                     }
                 }
@@ -327,7 +357,7 @@ async fn run_connection(
                                     )
                                     .await?;
                                 }
-                                let wants = sink_wants(params.prefer_quality, &video_streams);
+                                let wants = sink_wants(params.prefer_quality, &video_streams, &[]);
                                 socket.send(Message::Text(wants.to_string().into())).await?;
                                 if let Some(announce) = &video_announce {
                                     socket.send(Message::Text(announce.clone().into())).await?;
@@ -378,7 +408,7 @@ async fn run_connection(
                                     true,
                                 )
                                 .await?;
-                                let wants = sink_wants(params.prefer_quality, &video_streams);
+                                let wants = sink_wants(params.prefer_quality, &video_streams, &[]);
                                 socket.send(Message::Text(wants.to_string().into())).await?;
                             }
                             21 => {
@@ -511,14 +541,12 @@ async fn dispatch_rtp(
         match opus.decode(&plain) {
             Ok(pcm) if !pcm.is_empty() => {
                 note_decoded("audio");
-                let _ = events
-                    .send(MediaEvent::Audio {
-                        user_id,
-                        pcm,
-                        sample_rate: 48_000,
-                        channels: 2,
-                    })
-                    .await;
+                let _ = events.try_send(MediaEvent::Audio {
+                    user_id,
+                    pcm,
+                    sample_rate: 48_000,
+                    channels: 2,
+                });
             }
             Ok(_) => {}
             Err(err) => note_reject("opus decode", err),
@@ -910,6 +938,7 @@ fn restore_padded_payload(raw: &[u8]) -> Option<Bytes> {
 }
 
 async fn prepare_peer(
+    audio_slots: usize,
     video_slots: usize,
     rtp_tx: mpsc::Sender<(RTPCodecType, webrtc::rtp::packet::Packet)>,
 ) -> Result<Arc<webrtc::peer_connection::RTCPeerConnection>, MediaError> {
@@ -930,7 +959,7 @@ async fn prepare_peer(
         direction: RTCRtpTransceiverDirection::Recvonly,
         send_encodings: Vec::new(),
     };
-    for _ in 0..4 {
+    for _ in 0..audio_slots {
         peer.add_transceiver_from_kind(RTPCodecType::Audio, Some(recvonly()))
             .await
             .map_err(|err| MediaError::WebRtc(err.to_string()))?;
@@ -1069,11 +1098,19 @@ fn inactive_video(audio_ssrc: u32, ready_streams: &Value) -> Value {
     })
 }
 
-fn sink_wants(quality: u32, video: &[AssignedSsrc]) -> Value {
+fn sink_wants(quality: u32, video: &[AssignedSsrc], mute_audio: &[AssignedSsrc]) -> Value {
     let quality = quality.min(100);
     let mut body = serde_json::Map::new();
-    body.insert("any".into(), json!(quality));
+    if mute_audio.is_empty() {
+        body.insert("any".into(), json!(quality));
+    }
     let mut pixels = serde_json::Map::new();
+    for stream in mute_audio {
+        if stream.ssrc == 0 {
+            continue;
+        }
+        body.insert(stream.ssrc.to_string(), json!(0));
+    }
     for stream in video {
         if stream.ssrc == 0 {
             continue;
@@ -1261,7 +1298,20 @@ async fn apply_answer(
         .map_err(|err| MediaError::WebRtc(err.to_string()))?;
     peer.set_remote_description(description)
         .await
-        .map_err(|err| MediaError::WebRtc(err.to_string()))
+        .map_err(|err| MediaError::WebRtc(err.to_string()))?;
+    let mut video_recv = 0u32;
+    let mut video_other = 0u32;
+    for transceiver in peer.get_transceivers().await {
+        if transceiver.kind() != RTPCodecType::Video {
+            continue;
+        }
+        match transceiver.direction() {
+            RTCRtpTransceiverDirection::Recvonly | RTCRtpTransceiverDirection::Sendrecv => video_recv += 1,
+            _ => video_other += 1,
+        }
+    }
+    tracing::info!(video_recv, video_other, "video transceiver directions");
+    Ok(())
 }
 
 fn parse_id(value: Option<&Value>) -> Option<u64> {

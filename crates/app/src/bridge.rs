@@ -492,7 +492,7 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                             let due = media
                                 .stream_retry
                                 .get(&key)
-                                .is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
+                                .is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
                             if due {
                                 media.stream_retry.insert(key.clone(), Instant::now());
                                 if let Some(endpoint) = media.stream_endpoints.get(&key).cloned() {
