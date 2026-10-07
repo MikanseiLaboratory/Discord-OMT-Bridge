@@ -237,10 +237,7 @@ async fn run_connection(
                         }
                     }
                     if ready && (request_pli || keyframe_requests == 1 || keyframe_requests % 5 == 0) {
-                        // While the picture is missing, quality 0 on the audio SSRC
-                        // stops the audio-only forward so the video SSRC is sent.
-                        let mute = if resubscribed && video_rtp == 0 { &audio_streams[..] } else { &[] };
-                        let wants = sink_wants(params.prefer_quality, &video_streams, mute);
+                        let wants = sink_wants(params.prefer_quality, &video_streams, &audio_streams);
                         socket.send(Message::Text(wants.to_string().into())).await?;
                     }
                     // After video is flowing, a PLI every second forces intra frames
@@ -365,7 +362,7 @@ async fn run_connection(
                                     )
                                     .await?;
                                 }
-                                let wants = sink_wants(params.prefer_quality, &video_streams, &[]);
+                                let wants = sink_wants(params.prefer_quality, &video_streams, &audio_streams);
                                 socket.send(Message::Text(wants.to_string().into())).await?;
                                 if let Some(announce) = &video_announce {
                                     socket.send(Message::Text(announce.clone().into())).await?;
@@ -395,6 +392,8 @@ async fn run_connection(
                                         true,
                                     )
                                     .await?;
+                                    let wants = sink_wants(params.prefer_quality, &video_streams, &audio_streams);
+                                    socket.send(Message::Text(wants.to_string().into())).await?;
                                 }
                             }
                             12 => {
@@ -421,7 +420,7 @@ async fn run_connection(
                                     true,
                                 )
                                 .await?;
-                                let wants = sink_wants(params.prefer_quality, &video_streams, &[]);
+                                let wants = sink_wants(params.prefer_quality, &video_streams, &audio_streams);
                                 socket.send(Message::Text(wants.to_string().into())).await?;
                             }
                             21 => {
@@ -1129,19 +1128,17 @@ fn inactive_video(audio_ssrc: u32, ready_streams: &Value) -> Value {
     })
 }
 
-fn sink_wants(quality: u32, video: &[AssignedSsrc], mute_audio: &[AssignedSsrc]) -> Value {
+fn sink_wants(quality: u32, video: &[AssignedSsrc], audio: &[AssignedSsrc]) -> Value {
     let quality = quality.min(100);
     let mut body = serde_json::Map::new();
-    if mute_audio.is_empty() {
-        body.insert("any".into(), json!(quality));
-    }
-    let mut pixels = serde_json::Map::new();
-    for stream in mute_audio {
+    body.insert("any".into(), json!(quality));
+    for stream in audio {
         if stream.ssrc == 0 {
             continue;
         }
-        body.insert(stream.ssrc.to_string(), json!(0));
+        body.insert(stream.ssrc.to_string(), json!(100));
     }
+    let mut pixels = serde_json::Map::new();
     for stream in video {
         if stream.ssrc == 0 {
             continue;
