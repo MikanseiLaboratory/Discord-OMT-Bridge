@@ -8,8 +8,10 @@ publish.workspace = true
 [features]
 default = []
 ndi = ["dep:grafton-ndi"]
+asio = ["cpal/asio"]
 
 [dependencies]
+cpal = "0.15"
 grafton-ndi = { workspace = true, optional = true }
 openmediatransport = { workspace = true }
 thiserror = { workspace = true }

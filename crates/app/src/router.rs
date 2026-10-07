@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use egress::{AudioPublisher, FanoutPublisher, VideoPublisher};
+use egress::{AudioPublisher, FanoutPublisher, PlaybackEngine, SpeakerTarget, VideoPublisher};
 
-use crate::config::Config;
+use crate::config::{AudioSource, Config};
 use crate::snapshot::PreviewFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,6 +52,8 @@ impl SourceKind {
 pub enum Transport {
     Omt,
     Ndi,
+    Device,
+    Asio,
 }
 
 impl Transport {
@@ -59,6 +61,8 @@ impl Transport {
         match self {
             Self::Omt => "omt",
             Self::Ndi => "ndi",
+            Self::Device => "device",
+            Self::Asio => "asio",
         }
     }
 
@@ -66,14 +70,21 @@ impl Transport {
         match value {
             "omt" | "OMT" | "" => Ok(Self::Omt),
             "ndi" | "NDI" => Ok(Self::Ndi),
-            _ => Err("送出先は OMT か NDI です".into()),
+            "device" | "wasapi" => Ok(Self::Device),
+            "asio" | "ASIO" => Ok(Self::Asio),
+            _ => Err("送出先は OMT、NDI、再生デバイス、ASIO のいずれかです".into()),
         }
+    }
+
+    pub fn is_speaker(self) -> bool {
+        matches!(self, Self::Device | Self::Asio)
     }
 
     fn flags(self) -> (bool, bool) {
         match self {
             Self::Omt => (true, false),
             Self::Ndi => (false, true),
+            Self::Device | Self::Asio => (false, false),
         }
     }
 }
@@ -107,12 +118,28 @@ struct Binding {
     pinned: bool,
 }
 
+struct AudioTrack {
+    channel_id: u64,
+    user_id: u64,
+    volume: u16,
+    pending: VecDeque<i16>,
+}
+
+enum Outlet {
+    Network(FanoutPublisher),
+    Speakers,
+}
+
 struct OutputSlot {
     id: String,
     kind: SourceKind,
     transport: Transport,
     name: String,
-    publisher: FanoutPublisher,
+    device: String,
+    channel_start: u16,
+    channel_count: u16,
+    tracks: Vec<AudioTrack>,
+    outlet: Outlet,
     binding: Binding,
     frames: u64,
     dropped: u64,
@@ -140,6 +167,7 @@ pub struct SourceRouter {
     previews: Vec<PreviewSlot>,
     black: Vec<u8>,
     silence: Vec<i16>,
+    playback: PlaybackEngine,
 }
 
 impl SourceRouter {
@@ -150,6 +178,7 @@ impl SourceRouter {
             previews: Vec::new(),
             black: vec![0; 640 * 360 * 4],
             silence: vec![0; 960 * 2],
+            playback: PlaybackEngine::new(),
         };
         for route in &config.outputs {
             let kind = SourceKind::parse(&route.kind).map_err(anyhow::Error::msg)?;
@@ -162,6 +191,10 @@ impl SourceRouter {
                     transport,
                     route.channel_id,
                     route.user_id,
+                    route.device.clone(),
+                    route.channel_start,
+                    route.channel_count,
+                    route.members.clone(),
                 )
                 .map_err(anyhow::Error::msg)?;
         }
@@ -188,14 +221,32 @@ impl SourceRouter {
         if !config.allows(user_id) {
             return;
         }
+        if kind == SourceKind::Audio {
+            self.enqueue_mix(channel_id, user_id, pcm, channels);
+            return;
+        }
         let feed = FeedKey { channel_id, user_id, kind };
         for index in self.indexes_for(feed) {
-            let slot = &mut self.slots[index];
-            if let Err(err) = slot.publisher.publish_audio(pcm, sample_rate, channels) {
-                slot.dropped += 1;
-                tracing::warn!(%err, slot = %slot.name, "audio publish failed");
+            let speaker = matches!(self.slots[index].outlet, Outlet::Speakers);
+            let camera = self.slots[index].kind == SourceKind::Camera;
+            if speaker && camera {
+                continue;
+            }
+            if speaker {
+                let id = self.slots[index].id.clone();
+                self.playback.write(&id, pcm, sample_rate, channels);
+                self.slots[index].note_media();
+                continue;
+            }
+            let result = match &mut self.slots[index].outlet {
+                Outlet::Network(publisher) => publisher.publish_audio(pcm, sample_rate, channels).map_err(|err| err.to_string()),
+                Outlet::Speakers => Ok(()),
+            };
+            if let Err(err) = result {
+                self.slots[index].dropped += 1;
+                tracing::warn!(%err, slot = %self.slots[index].name, "audio publish failed");
             } else {
-                slot.note_media();
+                self.slots[index].note_media();
             }
         }
     }
@@ -217,14 +268,20 @@ impl SourceRouter {
         self.remember_preview(user_id, kind, bgra, width, height);
         let feed = FeedKey { channel_id, user_id, kind };
         for index in self.indexes_for(feed) {
-            let slot = &mut self.slots[index];
-            slot.width = width;
-            slot.height = height;
-            if let Err(err) = slot.publisher.publish_video(bgra, width, height, (30, 1)) {
-                slot.dropped += 1;
-                tracing::warn!(%err, slot = %slot.name, "video publish failed");
+            if matches!(self.slots[index].outlet, Outlet::Speakers) {
+                continue;
+            }
+            self.slots[index].width = width;
+            self.slots[index].height = height;
+            let result = match &mut self.slots[index].outlet {
+                Outlet::Network(publisher) => publisher.publish_video(bgra, width, height, (30, 1)).map_err(|err| err.to_string()),
+                Outlet::Speakers => Ok(()),
+            };
+            if let Err(err) = result {
+                self.slots[index].dropped += 1;
+                tracing::warn!(%err, slot = %self.slots[index].name, "video publish failed");
             } else {
-                slot.note_media();
+                self.slots[index].note_media();
             }
         }
     }
@@ -237,6 +294,10 @@ impl SourceRouter {
         transport: Transport,
         channel_id: u64,
         user_id: u64,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
+        members: Vec<AudioSource>,
     ) -> Result<(), String> {
         let name = name.trim().to_owned();
         if name.is_empty() {
@@ -251,7 +312,8 @@ impl SourceRouter {
         if self.slots.iter().any(|slot| slot.name == name) {
             return Err("同じ名前の出力があります".into());
         }
-        let publisher = open_publisher(&name, kind, transport)?;
+        let (channel_start, channel_count) = normalize_channels(channel_start, channel_count);
+        let outlet = open_outlet(&self.playback, &id, &name, kind, transport, &device, channel_start, channel_count)?;
         let assignment = route_feed(kind, channel_id, user_id);
         tracing::info!(%name, kind = kind.slug(), transport = transport.slug(), "created output");
         self.slots.push(OutputSlot {
@@ -259,7 +321,20 @@ impl SourceRouter {
             kind,
             transport,
             name,
-            publisher,
+            device,
+            channel_start,
+            channel_count,
+            tracks: members
+                .into_iter()
+                .filter(|member| member.channel_id != 0 && member.user_id != 0)
+                .map(|member| AudioTrack {
+                    channel_id: member.channel_id,
+                    user_id: member.user_id,
+                    volume: member.volume.min(200),
+                    pending: VecDeque::new(),
+                })
+                .collect(),
+            outlet,
             binding: Binding {
                 kind,
                 assignment,
@@ -278,10 +353,107 @@ impl SourceRouter {
         Ok(())
     }
 
+    pub fn set_audio_member(
+        &mut self,
+        slot_id: &str,
+        channel_id: u64,
+        user_id: u64,
+        volume: u16,
+        included: bool,
+    ) -> Result<(), String> {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == slot_id) else {
+            return Err("出力が見つかりません".into());
+        };
+        if slot.kind != SourceKind::Audio {
+            return Err("人の割り当ては音声出力だけです".into());
+        }
+        if !included || channel_id == 0 || user_id == 0 {
+            slot.tracks
+                .retain(|track| !(track.channel_id == channel_id && track.user_id == user_id));
+            return Ok(());
+        }
+        let volume = volume.min(200);
+        if let Some(track) = slot
+            .tracks
+            .iter_mut()
+            .find(|track| track.channel_id == channel_id && track.user_id == user_id)
+        {
+            track.volume = volume;
+            return Ok(());
+        }
+        slot.tracks.push(AudioTrack {
+            channel_id,
+            user_id,
+            volume,
+            pending: VecDeque::new(),
+        });
+        Ok(())
+    }
+
+    pub fn pump_audio(&mut self) {
+        const FRAME: usize = 960 * 2;
+        for index in 0..self.slots.len() {
+            if self.slots[index].kind != SourceKind::Audio {
+                continue;
+            }
+            let mut produced = 0;
+            while produced < 3 && self.slots[index].tracks.iter().any(|track| track.pending.len() >= FRAME) {
+                let pcm = mix_tracks(&mut self.slots[index].tracks, FRAME);
+                self.emit_pcm(index, &pcm);
+                produced += 1;
+            }
+        }
+    }
+
+    fn enqueue_mix(&mut self, channel_id: u64, user_id: u64, pcm: &[i16], channels: u16) {
+        let stereo = to_stereo(pcm, channels);
+        for slot in &mut self.slots {
+            if slot.kind != SourceKind::Audio {
+                continue;
+            }
+            let Some(track) = slot
+                .tracks
+                .iter_mut()
+                .find(|track| track.channel_id == channel_id && track.user_id == user_id)
+            else {
+                continue;
+            };
+            track.pending.extend(stereo.iter().copied());
+            let cap = 48_000 * 2;
+            if track.pending.len() > cap {
+                let extra = track.pending.len() - cap;
+                track.pending.drain(..extra);
+            }
+        }
+    }
+
+    fn emit_pcm(&mut self, index: usize, pcm: &[i16]) {
+        let speaker = matches!(self.slots[index].outlet, Outlet::Speakers);
+        if speaker {
+            let id = self.slots[index].id.clone();
+            self.playback.write(&id, pcm, 48_000, 2);
+            self.slots[index].note_media();
+            return;
+        }
+        let result = match &mut self.slots[index].outlet {
+            Outlet::Network(publisher) => publisher.publish_audio(pcm, 48_000, 2).map_err(|err| err.to_string()),
+            Outlet::Speakers => Ok(()),
+        };
+        match result {
+            Ok(()) => self.slots[index].note_media(),
+            Err(err) => {
+                self.slots[index].dropped += 1;
+                tracing::warn!(output = %self.slots[index].name, %err, "audio output failed");
+            }
+        }
+    }
+
     pub fn remove_output(&mut self, id: &str) -> Result<(), String> {
         let Some(index) = self.slots.iter().position(|slot| slot.id == id) else {
             return Err("出力が見つかりません".into());
         };
+        let id = self.slots[index].id.clone();
+        self.playback.unbind(&id);
         self.slots.remove(index);
         Ok(())
     }
@@ -294,16 +466,36 @@ impl SourceRouter {
         if self.slots.iter().any(|slot| slot.name == name && slot.id != id) {
             return Err("同じ名前の出力があります".into());
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) else {
+        let Some(index) = self.slots.iter().position(|slot| slot.id == id) else {
             return Err("出力が見つかりません".into());
         };
-        if slot.name == name {
+        if self.slots[index].name == name {
             return Ok(());
         }
-        let publisher = open_publisher(&name, slot.kind, slot.transport)?;
-        slot.publisher = publisher;
-        slot.name = name;
-        slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+        if matches!(self.slots[index].outlet, Outlet::Network(_)) {
+            let slot_id = self.slots[index].id.clone();
+            let kind = self.slots[index].kind;
+            let transport = self.slots[index].transport;
+            let device = self.slots[index].device.clone();
+            let channel_start = self.slots[index].channel_start;
+            let channel_count = self.slots[index].channel_count;
+            let outlet = open_outlet(
+                &self.playback,
+                &slot_id,
+                &name,
+                kind,
+                transport,
+                &device,
+                channel_start,
+                channel_count,
+            )?;
+            let slot = &mut self.slots[index];
+            slot.outlet = outlet;
+            slot.name = name;
+            slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+            return Ok(());
+        }
+        self.slots[index].name = name;
         Ok(())
     }
 
@@ -340,6 +532,28 @@ impl SourceRouter {
         self.reopen(index, kind, transport)
     }
 
+    pub fn set_playback(
+        &mut self,
+        slot_id: &str,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
+    ) -> Result<(), String> {
+        let Some(index) = self.slots.iter().position(|slot| slot.id == slot_id) else {
+            return Err("出力が見つかりません".into());
+        };
+        let (channel_start, channel_count) = normalize_channels(channel_start, channel_count);
+        self.slots[index].device = device;
+        self.slots[index].channel_start = channel_start;
+        self.slots[index].channel_count = channel_count;
+        if self.slots[index].transport.is_speaker() {
+            let kind = self.slots[index].kind;
+            let transport = self.slots[index].transport;
+            self.reopen(index, kind, transport)?;
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self, slot_id: &str) -> Result<(), String> {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == slot_id) else {
             return Err("出力が見つかりません".into());
@@ -353,16 +567,21 @@ impl SourceRouter {
     pub fn hold_open(&mut self) {
         let stale = Duration::from_millis(700);
         for slot in &mut self.slots {
+            if matches!(slot.outlet, Outlet::Speakers) {
+                continue;
+            }
             if slot.last_output.elapsed() < stale {
                 continue;
             }
             let audio = slot.kind != SourceKind::Camera;
             let video = slot.kind != SourceKind::Audio;
-            if audio {
-                let _ = slot.publisher.publish_audio(&self.silence, 48_000, 2);
-            }
-            if video {
-                let _ = slot.publisher.publish_video(&self.black, 640, 360, (1, 1));
+            if let Outlet::Network(publisher) = &mut slot.outlet {
+                if audio {
+                    let _ = publisher.publish_audio(&self.silence, 48_000, 2);
+                }
+                if video {
+                    let _ = publisher.publish_video(&self.black, 640, 360, (1, 1));
+                }
             }
             slot.last_output = Instant::now();
         }
@@ -378,9 +597,22 @@ impl SourceRouter {
                     .assignment
                     .map(|feed| (Some(feed.channel_id), Some(feed.user_id)))
                     .unwrap_or((None, None));
-                let assigned_name = user_id
-                    .and_then(|id| self.names.get(&id).cloned())
-                    .unwrap_or_default();
+                let assigned_name = if slot.kind == SourceKind::Audio {
+                    let names: Vec<String> = slot
+                        .tracks
+                        .iter()
+                        .map(|track| {
+                            self.names
+                                .get(&track.user_id)
+                                .cloned()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| track.user_id.to_string())
+                        })
+                        .collect();
+                    names.join("、")
+                } else {
+                    user_id.and_then(|id| self.names.get(&id).cloned()).unwrap_or_default()
+                };
                 let live = slot
                     .last_media
                     .map(|instant| instant.elapsed() < idle_after)
@@ -455,24 +687,66 @@ impl SourceRouter {
     }
 
     fn reopen(&mut self, index: usize, kind: SourceKind, transport: Transport) -> Result<(), String> {
+        let id = self.slots[index].id.clone();
         let name = self.slots[index].name.clone();
-        let publisher = open_publisher(&name, kind, transport)?;
+        let device = self.slots[index].device.clone();
+        let channel_start = self.slots[index].channel_start;
+        let channel_count = self.slots[index].channel_count;
+        self.playback.unbind(&id);
+        let outlet = open_outlet(&self.playback, &id, &name, kind, transport, &device, channel_start, channel_count)?;
         let slot = &mut self.slots[index];
         slot.kind = kind;
         slot.binding.kind = kind;
         slot.transport = transport;
-        slot.publisher = publisher;
+        slot.outlet = outlet;
         slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
         Ok(())
     }
 }
 
-fn open_publisher(name: &str, kind: SourceKind, transport: Transport) -> Result<FanoutPublisher, String> {
+fn open_outlet(
+    playback: &PlaybackEngine,
+    id: &str,
+    name: &str,
+    kind: SourceKind,
+    transport: Transport,
+    device: &str,
+    channel_start: u16,
+    channel_count: u16,
+) -> Result<Outlet, String> {
+    if matches!(kind, SourceKind::Camera | SourceKind::GoLive) && transport.is_speaker() {
+        return Err("映像の出し先は OMT か NDI です".into());
+    }
+    if transport.is_speaker() {
+        if transport == Transport::Asio && !egress::asio_available() {
+            return Err("このビルドには ASIO が含まれていません。ASIO SDK を入れて asio 機能付きでビルドしてください".into());
+        }
+        playback.bind(id, speaker_target(transport, device, channel_start, channel_count))?;
+        return Ok(Outlet::Speakers);
+    }
     let (omt, ndi) = transport.flags();
     if ndi && !cfg!(feature = "ndi") {
         return Err("NDI を使うには NDI 6 SDK を入れ、ndi 機能付きでビルドしてください".into());
     }
-    FanoutPublisher::open(name, kind.mode(), omt, ndi).map_err(|err| err.to_string())
+    FanoutPublisher::open(name, kind.mode(), omt, ndi)
+        .map(Outlet::Network)
+        .map_err(|err| err.to_string())
+}
+
+fn speaker_target(transport: Transport, device: &str, start: u16, count: u16) -> SpeakerTarget {
+    if transport == Transport::Asio {
+        SpeakerTarget::Asio {
+            name: device.to_owned(),
+            start,
+            count,
+        }
+    } else {
+        SpeakerTarget::Device { name: device.to_owned() }
+    }
+}
+
+fn normalize_channels(start: u16, count: u16) -> (u16, u16) {
+    (start.max(1), count.clamp(1, 64))
 }
 
 impl OutputSlot {
@@ -493,6 +767,47 @@ impl OutputSlot {
             self.window_start = Instant::now();
         }
     }
+}
+
+fn to_stereo(pcm: &[i16], channels: u16) -> Vec<i16> {
+    if channels <= 1 {
+        let mut stereo = Vec::with_capacity(pcm.len() * 2);
+        for sample in pcm {
+            stereo.push(*sample);
+            stereo.push(*sample);
+        }
+        return stereo;
+    }
+    if channels == 2 {
+        return pcm.to_vec();
+    }
+    let width = channels as usize;
+    let mut stereo = Vec::with_capacity(pcm.len() / width * 2);
+    for frame in pcm.chunks(width) {
+        if frame.len() < 2 {
+            break;
+        }
+        stereo.push(frame[0]);
+        stereo.push(frame[1]);
+    }
+    stereo
+}
+
+fn mix_tracks(tracks: &mut [AudioTrack], frame: usize) -> Vec<i16> {
+    let mut mixed = vec![0i32; frame];
+    for track in tracks.iter_mut() {
+        if track.pending.len() < frame {
+            continue;
+        }
+        let gain = i32::from(track.volume);
+        for (index, sample) in track.pending.drain(..frame).enumerate() {
+            mixed[index] += i32::from(sample) * gain / 100;
+        }
+    }
+    mixed
+        .into_iter()
+        .map(|sample| sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16)
+        .collect()
 }
 
 fn route_feed(kind: SourceKind, channel_id: u64, user_id: u64) -> Option<FeedKey> {
@@ -636,9 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn transport_parse_accepts_omt_and_ndi() {
+    fn transport_parse_accepts_known_destinations() {
         assert_eq!(Transport::parse("omt").unwrap(), Transport::Omt);
         assert_eq!(Transport::parse("NDI").unwrap(), Transport::Ndi);
+        assert_eq!(Transport::parse("device").unwrap(), Transport::Device);
+        assert_eq!(Transport::parse("asio").unwrap(), Transport::Asio);
         assert!(Transport::parse("both").is_err());
     }
 
@@ -650,5 +967,36 @@ mod tests {
         assert!(routed(&slots, camera).is_empty());
         let audio = FeedKey { channel_id: 1, user_id: 4, kind: SourceKind::Audio };
         assert_eq!(routed(&slots, audio), vec![0]);
+    }
+
+    #[test]
+    fn user_volumes_sum_and_clamp() {
+        let mut tracks = vec![
+            AudioTrack {
+                channel_id: 1,
+                user_id: 1,
+                volume: 100,
+                pending: std::collections::VecDeque::from([1000, 1000]),
+            },
+            AudioTrack {
+                channel_id: 1,
+                user_id: 2,
+                volume: 100,
+                pending: std::collections::VecDeque::from([1000, 1000]),
+            },
+        ];
+        assert_eq!(mix_tracks(&mut tracks, 2), vec![2000, 2000]);
+
+        tracks[0].volume = 200;
+        tracks[0].pending = std::collections::VecDeque::from([1000]);
+        tracks[1].volume = 0;
+        tracks[1].pending = std::collections::VecDeque::from([5000]);
+        assert_eq!(mix_tracks(&mut tracks, 1), vec![2000]);
+
+        tracks[0].volume = 200;
+        tracks[0].pending = std::collections::VecDeque::from([20_000]);
+        tracks[1].volume = 200;
+        tracks[1].pending = std::collections::VecDeque::from([20_000]);
+        assert_eq!(mix_tracks(&mut tracks, 1), vec![i16::MAX]);
     }
 }

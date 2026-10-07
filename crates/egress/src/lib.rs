@@ -3,10 +3,12 @@ mod fanout;
 mod frame;
 mod ndi;
 mod omt;
+mod playback;
 
 pub use error::EgressError;
 pub use fanout::{FanoutPublisher, SourceMode};
 pub use frame::{color_bars, sine_tone};
+pub use playback::{asio_available, list_output_devices, ListedDevice, PlaybackEngine, SpeakerTarget};
 
 use std::time::Duration;
 

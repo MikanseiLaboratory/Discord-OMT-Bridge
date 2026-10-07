@@ -1,3 +1,9 @@
+export type AudioMember = {
+  channel_id: string;
+  user_id: string;
+  volume: number;
+};
+
 export type Output = {
   id: string;
   name: string;
@@ -5,24 +11,19 @@ export type Output = {
   channel_id: string;
   user_id: string;
   transport: string;
+  device: string;
+  channel_start: number;
+  channel_count: number;
+  members: AudioMember[];
 };
 
 export type Settings = {
   token: string;
-  self_mute: boolean;
   self_deaf: boolean;
-  enable_omt: boolean;
-  enable_ndi: boolean;
-  source_prefix: string;
   allow_user_ids: string[];
   deny_user_ids: string[];
-  max_streams: number;
   max_video_slots: number;
-  prefer_quality: number;
   idle_timeout_secs: number;
-  audio_slots: number;
-  camera_slots: number;
-  golive_slots: number;
   client_build_number: number;
   outputs: Output[];
   path: string;
@@ -85,7 +86,7 @@ export type Snapshot = {
   slots: Slot[];
   last_error: string | null;
   ndi_available: boolean;
-  self_mute: boolean;
+  asio_available: boolean;
   self_deaf: boolean;
 };
 
@@ -121,7 +122,7 @@ export function emptySnapshot(): Snapshot {
     slots: [],
     last_error: null,
     ndi_available: false,
-    self_mute: true,
+    asio_available: false,
     self_deaf: false,
   };
 }
@@ -155,7 +156,10 @@ export function kindSlug(kind: string) {
 }
 
 export function transportLabel(transport: string) {
-  return transport === "ndi" ? "NDI" : "OMT";
+  if (transport === "ndi") return "NDI";
+  if (transport === "device") return "再生デバイス";
+  if (transport === "asio") return "ASIO";
+  return "OMT";
 }
 
 export function colorFromId(id: string) {
@@ -214,20 +218,23 @@ export function routeOf(output: Output) {
   return `${output.channel_id}:${output.user_id}:${kindSlug(output.kind)}`;
 }
 
-const INPUT_KINDS = [
-  ["audio", "音声"],
+const VIDEO_KINDS = [
   ["camera", "カメラ"],
   ["golive", "Go Live"],
 ] as const;
 
-export function matrixInputs(snapshot: Snapshot, output: Output) {
+export function isAudioOutput(output: Output) {
+  return kindSlug(output.kind) === "audio";
+}
+
+export function videoInputs(snapshot: Snapshot, output: Output) {
   const options = [{ value: "", label: "なし" }];
   const seen = new Set([""]);
   for (const seat of snapshot.seats || []) {
     const found = findChannel(snapshot.guilds, seat.channel_id);
     const channelName = found ? found.channel.name : "ボイスチャンネル";
     for (const member of found?.channel.members || []) {
-      for (const [kind, label] of INPUT_KINDS) {
+      for (const [kind, label] of VIDEO_KINDS) {
         const value = `${seat.channel_id}:${member.id}:${kind}`;
         if (seen.has(value)) continue;
         seen.add(value);
@@ -236,12 +243,36 @@ export function matrixInputs(snapshot: Snapshot, output: Output) {
     }
   }
   const current = routeOf(output);
-  if (current && !seen.has(current)) {
+  if (current && !seen.has(current) && !isAudioOutput(output)) {
     const slot = snapshot.slots.find((item) => item.id === output.id);
     const who = slot && slot.assigned_name && slot.assigned_name !== "取得中" ? slot.assigned_name : "取得中";
     options.push({ value: current, label: `${who} の${kindLabel(output.kind)}` });
   }
   return options;
+}
+
+export function voiceCandidates(snapshot: Snapshot) {
+  const options: { channelId: string; userId: string; label: string }[] = [];
+  const seen = new Set<string>();
+  for (const seat of snapshot.seats || []) {
+    const found = findChannel(snapshot.guilds, seat.channel_id);
+    const channelName = found ? found.channel.name : "ボイスチャンネル";
+    for (const member of found?.channel.members || []) {
+      const key = `${seat.channel_id}:${member.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      options.push({ channelId: seat.channel_id, userId: member.id, label: `${member.name}（${channelName}）` });
+    }
+  }
+  return options;
+}
+
+export function memberName(snapshot: Snapshot, channelId: string, userId: string) {
+  const found = findChannel(snapshot.guilds, channelId);
+  const member = found?.channel.members.find((item) => item.id === userId);
+  if (member?.name) return member.name;
+  const slot = snapshot.slots.find((item) => item.user_id === userId && item.assigned_name);
+  return slot?.assigned_name || userId;
 }
 
 export function outputStatus(snapshot: Snapshot, output: Output) {

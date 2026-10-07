@@ -69,6 +69,21 @@ description = "Choose OMT or NDI for an output."
 commands.allow = ["set_output_transport"]
 
 [[permission]]
+identifier = "allow-set-output-playback"
+description = "Choose the playback device or ASIO channels for an output."
+commands.allow = ["set_output_playback"]
+
+[[permission]]
+identifier = "allow-set-audio-member"
+description = "Add, remove, or set the volume of a person on an audio output."
+commands.allow = ["set_audio_member"]
+
+[[permission]]
+identifier = "allow-playback-devices"
+description = "List playback and ASIO devices."
+commands.allow = ["playback_devices"]
+
+[[permission]]
 identifier = "allow-recent-logs"
 description = "Read collected info and error logs."
 commands.allow = ["recent_logs"]

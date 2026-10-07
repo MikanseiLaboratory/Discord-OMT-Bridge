@@ -9,6 +9,7 @@ description = "Discord OMT Bridge desktop"
 [features]
 default = ["ndi"]
 ndi = ["discord-omt-bridge/ndi"]
+asio = ["discord-omt-bridge/asio"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

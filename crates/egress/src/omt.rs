@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openmediatransport::types::{Codec, ColorSpace, FrameType, MediaFrame};
 use openmediatransport::{Discovery, Sender};
@@ -20,6 +20,8 @@ pub struct OmtPublisher {
     name: String,
     stop: Arc<AtomicBool>,
     poll: Option<JoinHandle<()>>,
+    last_discard_log: Option<Instant>,
+    receiver_logged: bool,
 }
 
 impl OmtPublisher {
@@ -73,6 +75,8 @@ impl OmtPublisher {
             name: name.to_owned(),
             stop,
             poll: Some(poll),
+            last_discard_log: None,
+            receiver_logged: false,
         })
     }
 }
@@ -157,9 +161,36 @@ impl AudioPublisher for OmtPublisher {
             data: planar,
             ..MediaFrame::default()
         };
+        let peers = {
+            let mut sender = self
+                .sender
+                .lock()
+                .map_err(|_| EgressError::Omt("sender lock poisoned".into()))?;
+            sender.enable_audio_output();
+            sender.connection_count()
+        };
         self.audio
             .send(frame)
-            .map_err(|err| EgressError::Omt(err.to_string()))
+            .map_err(|err| EgressError::Omt(err.to_string()))?;
+        if peers == 0 {
+            self.receiver_logged = false;
+            let audible = pcm.iter().any(|sample| sample.saturating_abs() > 32);
+            let due = self
+                .last_discard_log
+                .map(|at| at.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(true);
+            if audible && due {
+                self.last_discard_log = Some(Instant::now());
+                tracing::info!(
+                    name = %self.name,
+                    "OMT audio PCM arrived but no receiver is connected, so the frame is discarded"
+                );
+            }
+        } else if !self.receiver_logged {
+            self.receiver_logged = true;
+            tracing::info!(name = %self.name, peers, "OMT audio receiver connected");
+        }
+        Ok(())
     }
 }
 

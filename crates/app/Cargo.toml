@@ -8,6 +8,7 @@ publish.workspace = true
 [features]
 default = ["ndi"]
 ndi = ["egress/ndi"]
+asio = ["egress/asio"]
 
 [dependencies]
 anyhow = { workspace = true }

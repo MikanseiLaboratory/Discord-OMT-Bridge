@@ -77,7 +77,10 @@ pub enum GatewayEvent {
     StreamAvailable(StreamEndpoint),
     StreamUpdated { stream_key: String, paused: bool },
     StreamEnded { stream_key: String },
-    Disconnected { reason: String },
+    /// The socket dropped, but the same session can be resumed.
+    /// `resumable` is false when Discord invalidated the session.
+    Resumed,
+    Disconnected { reason: String, resumable: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -104,11 +107,10 @@ pub fn spawn_gateway(token: String, client_build_number: u32) -> GatewayHandle {
     tokio::spawn(async move {
         if let Err(err) = run(token, client_build_number, event_tx.clone(), command_rx).await {
             tracing::error!(%err, "gateway stopped");
-            let _ = event_tx
-                .send(GatewayEvent::Disconnected {
-                    reason: err.to_string(),
-                })
-                .await;
+            let _ = event_tx.try_send(GatewayEvent::Disconnected {
+                reason: err.to_string(),
+                resumable: false,
+            });
         }
     });
     GatewayHandle { events, commands }
@@ -170,18 +172,23 @@ async fn run(
         };
         match connect_once(&token, build, &url, &events, &mut commands, &mut session).await {
             Ok(GatewayCommand::Shutdown) => return Ok(()),
-            Ok(_) => {}
+            Ok(_) => attempt = 0,
             Err(err) => {
-                tracing::warn!(%err, "gateway connection lost");
-                let _ = events
-                    .send(GatewayEvent::Disconnected {
-                        reason: err.to_string(),
-                    })
-                    .await;
+                let resumable = session.id.is_some();
+                tracing::warn!(%err, resumable, "gateway connection lost");
+                let _ = events.try_send(GatewayEvent::Disconnected {
+                    reason: err.to_string(),
+                    resumable,
+                });
+                if resumable {
+                    attempt = 0;
+                } else {
+                    attempt = attempt.saturating_add(1);
+                }
             }
         }
-        attempt = attempt.saturating_add(1);
-        let delay = Duration::from_millis(500 * 2u64.saturating_pow(attempt.min(5)));
+        let shift = if session.id.is_some() { 0 } else { attempt.min(5) };
+        let delay = Duration::from_millis(500 * 2u64.saturating_pow(shift));
         sleep(delay).await;
         if attempt > 8 && session.id.is_none() {
             return Err(GatewayError::Message("gave up reconnecting the gateway".into()));
@@ -197,23 +204,41 @@ async fn connect_once(
     commands: &mut mpsc::Receiver<GatewayCommand>,
     session: &mut Session,
 ) -> Result<GatewayCommand, GatewayError> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
+    let socket = tokio_tungstenite::connect_async(url).await?.0;
+    let (mut sink, mut stream) = socket.split();
+    let (write_tx, mut write_rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Some(message) = write_rx.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut heartbeat = interval(Duration::from_secs(40));
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut identified = false;
+    let mut awaiting_ack = false;
     loop {
         tokio::select! {
-            incoming = socket.next() => {
+            incoming = stream.next() => {
                 let Some(message) = incoming else { break };
                 let message = message?;
                 match message {
                     Message::Text(text) => {
                         let payload: Value = serde_json::from_str(&text)?;
+                        let op = payload.get("op").and_then(|value| value.as_u64());
+                        if op == Some(11) {
+                            awaiting_ack = false;
+                        }
+                        if op == Some(1) {
+                            send_heartbeat(&write_tx, session.sequence, &mut awaiting_ack)?;
+                        }
                         if let Some(interval_ms) = hello_interval(&payload) {
                             heartbeat = interval(Duration::from_millis(interval_ms));
-                            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
                             if !identified {
                                 let identify = if session.id.is_some() && session.sequence.is_some() {
+                                    tracing::info!("resuming gateway session");
                                     json!({
                                         "op": 6,
                                         "d": {
@@ -225,10 +250,8 @@ async fn connect_once(
                                 } else {
                                     identify_payload(token, build)
                                 };
-                                socket.send(Message::Text(identify.to_string().into())).await?;
+                                enqueue_write(&write_tx, Message::Text(identify.to_string().into()))?;
                                 identified = true;
-                                // Voice joins are owned by the bridge so several channels can be
-                                // queued one VoiceReady at a time after READY.
                                 replay_streams(events, session).await;
                             }
                         }
@@ -241,8 +264,12 @@ async fn connect_once(
                 }
             }
             _ = heartbeat.tick(), if identified => {
-                let beat = json!({"op": 1, "d": session.sequence});
-                socket.send(Message::Text(beat.to_string().into())).await?;
+                if awaiting_ack {
+                    return Err(GatewayError::Message(
+                        "gateway heartbeat was not acknowledged".into(),
+                    ));
+                }
+                send_heartbeat(&write_tx, session.sequence, &mut awaiting_ack)?;
             }
             command = commands.recv(), if identified => {
                 let Some(command) = command else {
@@ -259,7 +286,7 @@ async fn connect_once(
                         };
                         let payload = voice_state_payload(&join);
                         session.voice_join = Some(join);
-                        socket.send(Message::Text(payload.to_string().into())).await?;
+                        enqueue_write(&write_tx, Message::Text(payload.to_string().into()))?;
                     }
                     GatewayCommand::LeaveVoice { guild_id } => {
                         session.voice_join = None;
@@ -272,17 +299,51 @@ async fn connect_once(
                                 "self_deaf": false
                             }
                         });
-                        socket.send(Message::Text(payload.to_string().into())).await?;
+                        enqueue_write(&write_tx, Message::Text(payload.to_string().into()))?;
                     }
                     GatewayCommand::WatchStream { stream_key } => {
                         let payload = json!({"op": 20, "d": {"stream_key": stream_key}});
-                        socket.send(Message::Text(payload.to_string().into())).await?;
+                        enqueue_write(&write_tx, Message::Text(payload.to_string().into()))?;
                     }
                 }
             }
         }
     }
     Err(GatewayError::Message("gateway socket ended".into()))
+}
+
+fn enqueue_write(write_tx: &mpsc::Sender<Message>, message: Message) -> Result<(), GatewayError> {
+    match write_tx.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(GatewayError::Message("gateway send is stalled".into())),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(GatewayError::Message("gateway send failed".into())),
+    }
+}
+
+fn send_heartbeat(
+    write_tx: &mpsc::Sender<Message>,
+    sequence: Option<u64>,
+    awaiting_ack: &mut bool,
+) -> Result<(), GatewayError> {
+    let beat = json!({"op": 1, "d": sequence});
+    match write_tx.try_send(Message::Text(beat.to_string().into())) {
+        Ok(()) => {
+            *awaiting_ack = true;
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(GatewayError::Message("gateway send is stalled".into()))
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(GatewayError::Message("gateway send failed".into())),
+    }
+}
+
+fn emit(events: &mpsc::Sender<GatewayEvent>, event: GatewayEvent) {
+    if let Err(err) = events.try_send(event) {
+        if matches!(err, mpsc::error::TrySendError::Full(_)) {
+            tracing::warn!("dropped a gateway event; the bridge is behind");
+        }
+    }
 }
 
 async fn handle_payload(
@@ -306,6 +367,7 @@ async fn handle_payload(
     };
     let data = payload.get("d").cloned().unwrap_or(Value::Null);
     match name {
+        "RESUMED" => emit(events, GatewayEvent::Resumed),
         "READY" => {
             session.id = data.get("session_id").and_then(|value| value.as_str()).map(str::to_owned);
             session.resume_url = data
@@ -325,14 +387,14 @@ async fn handle_payload(
                 .get("avatar")
                 .and_then(|value| value.as_str())
                 .map(str::to_owned);
-            events
-                .send(GatewayEvent::Ready {
+            emit(
+                events,
+                GatewayEvent::Ready {
                     user_id,
                     username,
                     avatar,
-                })
-                .await
-                .ok();
+                },
+            );
             let missing = publish_directory(events, data.get("guilds"), token).await;
             tracing::info!(guilds = missing.seen, without_channels = missing.ids.len(), "loaded guilds from ready");
             if !missing.ids.is_empty() {
@@ -361,7 +423,7 @@ async fn handle_payload(
             }
             if let Some(guild) = crate::directory::read_guild(&data) {
                 let guild_id = guild.id;
-                events.send(GatewayEvent::GuildUpsert(guild)).await.ok();
+                emit(events, GatewayEvent::GuildUpsert(guild));
                 if name == "GUILD_CREATE" {
                     if let Some(states) = data.get("voice_states").and_then(|value| value.as_array()) {
                         for state in states {
@@ -376,27 +438,18 @@ async fn handle_payload(
                 return Ok(());
             }
             if let Some(guild_id) = parse_id(data.get("id")) {
-                events
-                    .send(GatewayEvent::GuildRemoved { guild_id })
-                    .await
-                    .ok();
+                emit(events, GatewayEvent::GuildRemoved { guild_id });
             }
         }
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
             if let (Some(guild_id), Some(channel)) = (parse_id(data.get("guild_id")), crate::directory::read_channel(&data))
             {
-                events
-                    .send(GatewayEvent::ChannelUpsert { guild_id, channel })
-                    .await
-                    .ok();
+                emit(events, GatewayEvent::ChannelUpsert { guild_id, channel });
             }
         }
         "CHANNEL_DELETE" => {
             if let (Some(guild_id), Some(channel_id)) = (parse_id(data.get("guild_id")), parse_id(data.get("id"))) {
-                events
-                    .send(GatewayEvent::ChannelRemoved { guild_id, channel_id })
-                    .await
-                    .ok();
+                emit(events, GatewayEvent::ChannelRemoved { guild_id, channel_id });
             }
         }
         "VOICE_SERVER_UPDATE" => {
@@ -427,14 +480,14 @@ async fn handle_payload(
             let paused = data.get("paused").and_then(|value| value.as_bool()).unwrap_or(false);
             note_stream(session, &stream_key, rtc_server_id, None, None, paused);
             let user_id = crate::parse_stream_key(&stream_key).map(|(_, _, user_id)| user_id).unwrap_or(0);
-            events
-                .send(GatewayEvent::StreamAnnounced {
+            emit(
+                events,
+                GatewayEvent::StreamAnnounced {
                     stream_key: stream_key.clone(),
                     user_id,
                     paused,
-                })
-                .await
-                .ok();
+                },
+            );
             emit_stream_if_ready(events, session, &stream_key).await;
         }
         "STREAM_SERVER_UPDATE" => {
@@ -452,18 +505,12 @@ async fn handle_payload(
             if let Some(stream) = session.pending_streams.iter_mut().find(|stream| stream.stream_key == stream_key) {
                 stream.paused = paused;
             }
-            events
-                .send(GatewayEvent::StreamUpdated { stream_key, paused })
-                .await
-                .ok();
+            emit(events, GatewayEvent::StreamUpdated { stream_key, paused });
         }
         "STREAM_DELETE" => {
             let stream_key = data.get("stream_key").and_then(|value| value.as_str()).unwrap_or("").to_owned();
             session.pending_streams.retain(|stream| stream.stream_key != stream_key);
-            events
-                .send(GatewayEvent::StreamEnded { stream_key })
-                .await
-                .ok();
+            emit(events, GatewayEvent::StreamEnded { stream_key });
         }
         _ => {}
     }
@@ -482,17 +529,17 @@ async fn emit_voice_if_ready(events: &mpsc::Sender<GatewayEvent>, session: &mut 
     let server_id = guild_id.unwrap_or(user_id);
     let channel_id = session.voice_join.as_ref().map(|join| join.channel_id);
     let guild_id = guild_id.or_else(|| session.voice_join.as_ref().map(|join| join.guild_id));
-    events
-        .send(GatewayEvent::VoiceReady(VoiceEndpoint {
+    emit(
+        events,
+        GatewayEvent::VoiceReady(VoiceEndpoint {
             guild_id,
             channel_id,
             endpoint,
             token,
             session_id,
             server_id,
-        }))
-        .await
-        .ok();
+        }),
+    );
     session.voice_token = None;
 }
 
@@ -544,17 +591,17 @@ async fn emit_stream_if_ready(events: &mpsc::Sender<GatewayEvent>, session: &mut
     };
     let user_id = crate::parse_stream_key(stream_key).map(|(_, _, user_id)| user_id).unwrap_or(0);
     let paused = stream.paused;
-    events
-        .send(GatewayEvent::StreamAvailable(StreamEndpoint {
+    emit(
+        events,
+        GatewayEvent::StreamAvailable(StreamEndpoint {
             stream_key: stream_key.to_owned(),
             endpoint,
             token,
             rtc_server_id,
             user_id,
             paused,
-        }))
-        .await
-        .ok();
+        }),
+    );
 }
 
 fn voice_state_payload(join: &VoiceJoin) -> Value {
@@ -577,14 +624,14 @@ async fn replay_streams(events: &mpsc::Sender<GatewayEvent>, session: &Session) 
         let user_id = crate::parse_stream_key(&stream.stream_key)
             .map(|(_, _, user_id)| user_id)
             .unwrap_or(0);
-        events
-            .send(GatewayEvent::StreamAnnounced {
+        emit(
+            events,
+            GatewayEvent::StreamAnnounced {
                 stream_key: stream.stream_key.clone(),
                 user_id,
                 paused: false,
-            })
-            .await
-            .ok();
+            },
+        );
     }
 }
 
@@ -632,7 +679,7 @@ async fn dispatch_voice(events: &mpsc::Sender<GatewayEvent>, token: &str, data: 
             schedule_profile(token, &member, events.clone());
         }
     }
-    events.send(GatewayEvent::VoiceMember(member)).await.ok();
+    emit(events, GatewayEvent::VoiceMember(member));
 }
 
 fn cached_profile(user_id: u64) -> Option<(String, Option<String>)> {
@@ -665,10 +712,7 @@ fn schedule_profile(token: &str, member: &VoiceMember, events: mpsc::Sender<Gate
         if let Ok(mut cache) = PROFILE_CACHE.lock() {
             cache.insert(user_id, (name.clone(), avatar.clone()));
         }
-        events
-            .send(GatewayEvent::Profile { user_id, name, avatar })
-            .await
-            .ok();
+        emit(&events, GatewayEvent::Profile { user_id, name, avatar });
     });
 }
 
@@ -742,7 +786,7 @@ async fn publish_directory(events: &mpsc::Sender<GatewayEvent>, guilds: Option<&
                 dispatch_voice(events, token, state, Some(guild_id)).await;
             }
         }
-        events.send(GatewayEvent::GuildUpsert(record)).await.ok();
+        emit(events, GatewayEvent::GuildUpsert(record));
         if !has_channels {
             missing.push(guild_id);
         }
@@ -793,13 +837,13 @@ async fn backfill_channels(token: String, guild_ids: Vec<u64>, events: mpsc::Sen
         let count = channels.len();
         for channel in channels {
             if let Some(record) = crate::directory::read_channel(channel) {
-                events
-                    .send(GatewayEvent::ChannelUpsert {
+                emit(
+                    &events,
+                    GatewayEvent::ChannelUpsert {
                         guild_id,
                         channel: record,
-                    })
-                    .await
-                    .ok();
+                    },
+                );
             }
         }
         tracing::info!(guild_id, channels = count, "loaded guild channels");

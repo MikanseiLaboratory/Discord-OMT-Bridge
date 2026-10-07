@@ -196,6 +196,7 @@ async fn run_connection(
     let mut keyframe_requests = 0u32;
     let mut answer_deadline: Option<Instant> = None;
     let mut local_audio_ssrc = 0u32;
+    let mut voice_seq: Option<i64> = None;
     let mut video_announce: Option<String> = None;
     let mut answer_tick = interval(Duration::from_millis(200));
     answer_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -266,7 +267,10 @@ async fn run_connection(
                 }
             }
             _ = heartbeat.tick(), if heartbeats_started => {
-                let nonce = json!({"op": 3, "d": { "t": chrono_millis() }});
+                let nonce = json!({
+                    "op": 3,
+                    "d": { "t": chrono_millis(), "seq_ack": voice_seq.unwrap_or(-1) }
+                });
                 socket.send(Message::Text(nonce.to_string().into())).await?;
             }
             incoming = socket.next() => {
@@ -275,6 +279,9 @@ async fn run_connection(
                 match message {
                     Message::Text(text) => {
                         let payload: Value = serde_json::from_str(&text)?;
+                        if let Some(seq) = payload.get("seq").and_then(|value| value.as_i64()) {
+                            voice_seq = Some(seq);
+                        }
                         let op = payload.get("op").and_then(|value| value.as_u64()).unwrap_or(99);
                         match op {
                             8 => {
@@ -318,6 +325,7 @@ async fn run_connection(
                                     let announce = inactive_video(local_audio_ssrc, &ready_streams);
                                     video_announce = Some(announce.to_string());
                                     socket.send(Message::Text(announce.to_string().into())).await?;
+                                    socket.send(Message::Text(register_speaking(local_audio_ssrc).to_string().into())).await?;
                                     tracing::info!(
                                         audio_ssrc = local_audio_ssrc,
                                         streams = ready_streams.as_array().map(|items| items.len()).unwrap_or(0),
@@ -362,10 +370,15 @@ async fn run_connection(
                                 if let Some(announce) = &video_announce {
                                     socket.send(Message::Text(announce.clone().into())).await?;
                                 }
+                                if local_audio_ssrc != 0 {
+                                    socket.send(Message::Text(register_speaking(local_audio_ssrc).to_string().into())).await?;
+                                }
                             }
                             5 => {
                                 let user_id = parse_id(payload.pointer("/d/user_id")).unwrap_or(0);
                                 let ssrc = payload.pointer("/d/ssrc").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let speaking = payload.pointer("/d/speaking").and_then(|v| v.as_u64()).unwrap_or(0);
+                                tracing::info!(ssrc, speaking, known_user = user_id != 0, "speaking");
                                 if user_id != 0 && user_id != params.user_id && ssrc != 0 {
                                     book.audio.insert(ssrc, user_id);
                                     remember_audio(&mut audio_streams, user_id, ssrc);
@@ -817,7 +830,14 @@ async fn handle_video_opcode(
         .map(|(ssrc, quality, _, rid, active, width, height)| format!("ssrc={ssrc} rid={rid} q={quality} active={active} {width}x{height}"))
         .collect::<Vec<_>>()
         .join(" ");
-    tracing::info!(video, chosen, layers = layers.len(), described, "video ssrcs");
+    tracing::info!(
+        video,
+        audio = data.get("audio_ssrc").and_then(|value| value.as_u64()).unwrap_or(0),
+        chosen,
+        layers = layers.len(),
+        described,
+        "video ssrcs"
+    );
     if chosen == 0 && video == 0 {
         book.video.retain(|_, owner| *owner != user_id);
         video_streams.retain(|stream| stream.user_id != user_id);
@@ -1059,6 +1079,17 @@ async fn offer_bundle(
     let h264 = payload_of(&sdp, "H264").unwrap_or(102);
     tracing::info!(av1 = sdp.contains("AV1"), h264 = sdp.contains("H264"), "local offer");
     Ok((fragment, Value::Array(json_codecs), sdp, h264, rtx))
+}
+
+fn register_speaking(ssrc: u32) -> Value {
+    json!({
+        "op": 5,
+        "d": {
+            "speaking": 0,
+            "delay": 0,
+            "ssrc": ssrc
+        }
+    })
 }
 
 fn inactive_video(audio_ssrc: u32, ready_streams: &Value) -> Value {

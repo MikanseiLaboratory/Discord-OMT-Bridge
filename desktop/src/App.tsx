@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { IconGear, IconHash, IconHeadphones, IconHome, IconLeave, IconLog, IconMic, IconSpeaker } from "./icons";
+import { IconGear, IconHash, IconHeadphones, IconHome, IconLeave, IconLog, IconSpeaker } from "./icons";
 import {
   type AuthState,
   type AuthStep,
@@ -19,18 +19,27 @@ import {
   guildIconUrl,
   inTauri,
   initial,
+  isAudioOutput,
   kindLabel,
-  matrixInputs,
+  memberName,
   outputStatus,
   phaseLabel,
   routeOf,
   transportLabel,
+  videoInputs,
+  voiceCandidates,
 } from "./model";
 
 type Mode = "gate" | "shell" | "settings" | "logs";
 type PreviewFrame = { user_id: string; name: string; kind: string; width: number; height: number; rgba: string };
 type LogLine = { id: number; at_ms: number; level: string; target: string; message: string };
 type Picked = { channelId: string; userId: string; name: string } | null;
+type AudioDevice = { name: string; host: string; channels: number };
+
+function knownTransport(value: string) {
+  if (value === "ndi" || value === "device" || value === "asio") return value;
+  return "omt";
+}
 
 function messageOf(err: unknown) {
   return err instanceof Error ? err.message : String(err);
@@ -52,22 +61,46 @@ function Matrix({
   onRename,
   onTransport,
   onRoute,
+  onPlayback,
+  onMember,
   onRemove,
 }: {
   snapshot: Snapshot;
   settings: Settings;
-  onAdd: (name: string, transport: string) => Promise<void>;
+  onAdd: (name: string, kind: string, transport: string) => Promise<void>;
   onRename: (outputId: string, name: string) => Promise<void>;
   onTransport: (outputId: string, transport: string) => Promise<void>;
   onRoute: (outputId: string, value: string) => Promise<void>;
+  onPlayback: (outputId: string, device: string, channelStart: number, channelCount: number) => Promise<void>;
+  onMember: (outputId: string, channelId: string, userId: string, volume: number, included: boolean) => Promise<void>;
   onRemove: (output: Output) => Promise<void>;
 }) {
   const [name, setName] = useState("");
+  const [kind, setKind] = useState("audio");
   const [transport, setTransport] = useState(snapshot.ndi_available ? "ndi" : "omt");
+  const audio = kind === "audio";
+  const [devices, setDevices] = useState<AudioDevice[]>([]);
   const outputs = settings.outputs || [];
+  useEffect(() => {
+    let stop = false;
+    const pull = async () => {
+      try {
+        const next = await invoke<AudioDevice[]>("playback_devices");
+        if (!stop) setDevices(next);
+      } catch {
+        if (!stop) setDevices([]);
+      }
+    };
+    void pull();
+    const timer = window.setInterval(() => void pull(), 5000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, []);
   return (
     <div className="matrix">
-      <p className="hint">出力は OMT か NDI を選びます。入力は参加中のメンバーの音声、カメラ、Go Live から選びます。同じ入力を複数の出力へ送れます。</p>
+      <p className="hint">音声と映像は別の出力です。音声は複数人を混ぜて、人ごとに音量を変えられます。映像は1人のカメラか Go Live で、出し先は OMT か NDI です。Go Live の音声は、その映像の OMT に乗せて送れます。</p>
       <div className="matrix-add">
         <input
           type="text"
@@ -77,22 +110,30 @@ function Matrix({
           onKeyDown={(event) => {
             if (event.key !== "Enter") return;
             event.preventDefault();
-            void onAdd(name, transport)
+            void onAdd(name, kind, audio ? transport : transport === "device" || transport === "asio" ? "omt" : transport)
               .then(() => setName(""))
               .catch(() => {});
           }}
         />
-        <select value={transport} onChange={(event) => setTransport(event.target.value)}>
-          <option value="ndi" disabled={!snapshot.ndi_available}>
-            NDI
-          </option>
-          <option value="omt">OMT</option>
+        <select
+          aria-label="出力の種類"
+          value={kind}
+          onChange={(event) => {
+            const next = event.target.value;
+            setKind(next);
+            if (next !== "audio" && (transport === "device" || transport === "asio")) setTransport("omt");
+          }}
+        >
+          <option value="audio">音声</option>
+          <option value="camera">カメラ</option>
+          <option value="golive">Go Live</option>
         </select>
+        <TransportSelect snapshot={snapshot} audio={audio} value={transport} onChange={setTransport} />
         <button
           className="primary"
           type="button"
           onClick={() => {
-            void onAdd(name, transport)
+            void onAdd(name, kind, audio ? transport : transport === "device" || transport === "asio" ? "omt" : transport)
               .then(() => setName(""))
               .catch(() => {});
           }}
@@ -101,67 +142,203 @@ function Matrix({
         </button>
       </div>
       {outputs.length === 0 ? (
-        <div className="empty">出力はまだありません。名前と OMT / NDI を決めて追加すると、その名前で送出されます。</div>
-      ) : null}
-      {outputs.map((output) => (
-        <OutputCard
-          key={output.id}
-          output={output}
-          snapshot={snapshot}
-          onRename={onRename}
-          onTransport={onTransport}
-          onRoute={onRoute}
-          onRemove={onRemove}
-        />
-      ))}
+        <div className="empty">出力はまだありません。名前と出し先を決めて追加すると、その名前で送出されます。</div>
+      ) : (
+        <div className="matrix-list">
+          {outputs.map((output) => (
+            <OutputCard
+              key={output.id}
+              output={output}
+              snapshot={snapshot}
+              devices={devices}
+              onRename={onRename}
+              onTransport={onTransport}
+              onRoute={onRoute}
+              onPlayback={onPlayback}
+              onMember={onMember}
+              onRemove={onRemove}
+            />
+          ))}
+        </div>
+      )}
     </div>
+  );
+}
+
+function TransportSelect({
+  snapshot,
+  audio,
+  value,
+  onChange,
+}: {
+  snapshot: Snapshot;
+  audio: boolean;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const current = knownTransport(value);
+  return (
+    <select value={current} onChange={(event) => onChange(event.target.value)}>
+      <option value="ndi" disabled={!snapshot.ndi_available && current !== "ndi"}>
+        NDI
+      </option>
+      <option value="omt">OMT</option>
+      {audio || current === "device" ? <option value="device">再生デバイス</option> : null}
+      {audio && (snapshot.asio_available || current === "asio") ? (
+        <option value="asio" disabled={!snapshot.asio_available}>
+          ASIO
+        </option>
+      ) : null}
+    </select>
   );
 }
 
 function OutputCard({
   output,
   snapshot,
+  devices,
   onRename,
   onTransport,
   onRoute,
+  onPlayback,
+  onMember,
   onRemove,
 }: {
   output: Output;
   snapshot: Snapshot;
+  devices: AudioDevice[];
   onRename: (outputId: string, name: string) => Promise<void>;
   onTransport: (outputId: string, transport: string) => Promise<void>;
   onRoute: (outputId: string, value: string) => Promise<void>;
+  onPlayback: (outputId: string, device: string, channelStart: number, channelCount: number) => Promise<void>;
+  onMember: (outputId: string, channelId: string, userId: string, volume: number, included: boolean) => Promise<void>;
   onRemove: (output: Output) => Promise<void>;
 }) {
   const [name, setName] = useState(output.name);
+  const [volumes, setVolumes] = useState<Record<string, number>>({});
   useEffect(() => setName(output.name), [output.name]);
   const current = routeOf(output);
-  const transport = output.transport === "ndi" ? "ndi" : "omt";
+  const audio = isAudioOutput(output);
+  const transport = knownTransport(output.transport);
+  const host = transport === "asio" ? "asio" : "device";
+  const choices = devices.filter((device) => device.host === host);
+  const members = output.members || [];
+  const playback = async (device: string, channelStart: number, channelCount: number) => {
+    await onPlayback(output.id, device, channelStart, channelCount);
+  };
+  const commitVolume = (channelId: string, userId: string) => {
+    const key = `${channelId}:${userId}`;
+    const volume = volumes[key];
+    if (volume === undefined) return;
+    void onMember(output.id, channelId, userId, volume, true).finally(() => {
+      setVolumes((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    });
+  };
   return (
     <div className="source-card">
       <input
         type="text"
+        aria-label="出力の名前"
         value={name}
         onChange={(event) => setName(event.target.value)}
         onBlur={() => void onRename(output.id, name)}
       />
-      <div className="matrix-label">出力</div>
-      <select value={transport} onChange={(event) => void onTransport(output.id, event.target.value)}>
-        <option value="ndi" disabled={!snapshot.ndi_available && transport !== "ndi"}>
-          NDI
-        </option>
-        <option value="omt">OMT</option>
-      </select>
-      <div className="matrix-label">入力</div>
-      <select value={current} onChange={(event) => void onRoute(output.id, event.target.value)}>
-        {matrixInputs(snapshot, output).map((option) => (
-          <option key={option.value || "none"} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
+      <TransportSelect snapshot={snapshot} audio={audio} value={transport} onChange={(value) => void onTransport(output.id, value)} />
+      {transport === "device" || transport === "asio" ? (
+        <select aria-label="再生デバイス" value={output.device || ""} onChange={(event) => void playback(event.target.value, output.channel_start || 1, output.channel_count || 2)}>
+          {transport === "device" ? <option value="">既定の再生デバイス</option> : <option value="">ASIO デバイスを選択</option>}
+          {output.device && !choices.some((device) => device.name === output.device) ? <option value={output.device}>{output.device}</option> : null}
+          {choices.map((device) => (
+            <option key={`${device.host}:${device.name}`} value={device.name}>
+              {device.name}
+              {device.channels ? ` (${device.channels}ch)` : ""}
+            </option>
+          ))}
+        </select>
+      ) : null}
+      {transport === "asio" ? (
+        <>
+          <input
+            className="channel-field"
+            type="number"
+            min={1}
+            aria-label="開始チャンネル"
+            title="開始チャンネル"
+            value={output.channel_start || 1}
+            onChange={(event) => void playback(output.device || "", Number(event.target.value || 1), output.channel_count || 2)}
+          />
+          <input
+            className="channel-field"
+            type="number"
+            min={1}
+            max={64}
+            aria-label="チャンネル数"
+            title="チャンネル数"
+            value={output.channel_count || 2}
+            onChange={(event) => void playback(output.device || "", output.channel_start || 1, Number(event.target.value || 2))}
+          />
+        </>
+      ) : null}
+      {audio ? (
+        <>
+          {members.map((member) => {
+            const key = `${member.channel_id}:${member.user_id}`;
+            const volume = volumes[key] ?? member.volume ?? 100;
+            return (
+              <div className="member-row" key={key}>
+                <span>{memberName(snapshot, member.channel_id, member.user_id)}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={200}
+                  aria-label="音量"
+                  value={volume}
+                  onChange={(event) => setVolumes((current) => ({ ...current, [key]: Number(event.target.value) }))}
+                  onPointerUp={() => commitVolume(member.channel_id, member.user_id)}
+                  onKeyUp={() => commitVolume(member.channel_id, member.user_id)}
+                  onBlur={() => commitVolume(member.channel_id, member.user_id)}
+                />
+                <span className="volume">{volume}%</span>
+                <button className="secondary" type="button" onClick={() => void onMember(output.id, member.channel_id, member.user_id, volume, false)}>
+                  外す
+                </button>
+              </div>
+            );
+          })}
+          <select
+            aria-label="人を追加"
+            value=""
+            onChange={(event) => {
+              const [channelId = "", userId = ""] = event.target.value.split(":");
+              if (!channelId || !userId) return;
+              void onMember(output.id, channelId, userId, 100, true);
+            }}
+          >
+            <option value="">人を追加</option>
+            {voiceCandidates(snapshot)
+              .filter((candidate) => !members.some((member) => member.channel_id === candidate.channelId && member.user_id === candidate.userId))
+              .map((candidate) => (
+                <option key={`${candidate.channelId}:${candidate.userId}`} value={`${candidate.channelId}:${candidate.userId}`}>
+                  {candidate.label}
+                </option>
+              ))}
+          </select>
+        </>
+      ) : (
+        <select aria-label="入力" value={current} onChange={(event) => void onRoute(output.id, event.target.value)}>
+          {videoInputs(snapshot, output).map((option) => (
+            <option key={option.value || "none"} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      )}
       <div className="meta">
-        {transportLabel(transport)} · {current ? kindLabel(output.kind) : "入力なし"} · {outputStatus(snapshot, output)}
+        {transportLabel(transport)} · {audio ? (members.length ? `${members.length}人` : "入力なし") : current ? kindLabel(output.kind) : "入力なし"} · {outputStatus(snapshot, output)}
       </div>
       <button className="secondary" type="button" onClick={() => void onRemove(output)}>
         削除
@@ -277,7 +454,6 @@ function SettingsScreen({
   const lines = (text: string) => text.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
   const collected = (): Settings => ({
     ...draft,
-    enable_ndi: snapshot.ndi_available && draft.enable_ndi,
     allow_user_ids: lines(allowText),
     deny_user_ids: lines(denyText),
     outputs: initial.outputs || [],
@@ -340,59 +516,13 @@ function SettingsScreen({
         </section>
         <section className="settings-card" hidden={tab !== "voice"}>
           <h2>ボイスと送出</h2>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.self_mute}
-              onChange={(event) => {
-                mark();
-                setDraft({ ...draft, self_mute: event.target.checked });
-              }}
-            />
-            参加時にマイクをミュートする
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.self_deaf}
-              onChange={(event) => {
-                mark();
-                setDraft({ ...draft, self_deaf: event.target.checked });
-              }}
-            />
-            スピーカーをミュートする
-          </label>
           <p className="hint">
+            マイクは常にミュートです。スピーカーミュートはホームのボタンです。映像は最高画質で受信し、告知された Go Live は制限なく視聴します。
             {snapshot.ndi_available
-              ? "送出先は出力ごとに OMT か NDI を選びます。新しく追加する出力の初期値は NDI です。"
-              : "このビルドには NDI が含まれていません。NDI 6 SDK を入れて起動し直してください。出力は OMT で追加できます。"}
+              ? "映像の出し先は OMT か NDI です。音声はそれに加えて再生デバイスと ASIO も選べます。"
+              : "このビルドには NDI が含まれていません。NDI 6 SDK を入れて起動し直してください。"}
+            {snapshot.asio_available ? "" : " ASIO は、Steinberg ASIO SDK を入れて asio 機能付きでビルドしたときだけ選べます。"}
           </p>
-          <label className="field">
-            ソース名の接頭辞
-            <input
-              type="text"
-              value={draft.source_prefix || "Discord"}
-              onChange={(event) => {
-                mark();
-                setDraft({ ...draft, source_prefix: event.target.value });
-              }}
-            />
-          </label>
-          <label className="field">
-            希望画質 <span>{draft.prefer_quality ?? 100}</span>
-            <input
-              className="slider"
-              type="range"
-              min={0}
-              max={100}
-              value={draft.prefer_quality ?? 100}
-              onChange={(event) => {
-                mark();
-                setDraft({ ...draft, prefer_quality: Number(event.target.value) });
-              }}
-            />
-          </label>
-          <p className="hint">画質と受信数は、次に接続したときから使われます。OMT / NDI の切り替えは、そのあと追加する出力から使われます。出力の追加と名前、入力は出力の欄で決めます。</p>
           <label className="field">
             映像の受信スロット
             <input
@@ -407,19 +537,6 @@ function SettingsScreen({
             />
           </label>
           <label className="field">
-            Go Live の同時視聴数
-            <input
-              type="number"
-              min={1}
-              max={32}
-              value={draft.max_streams || 8}
-              onChange={(event) => {
-                mark();
-                setDraft({ ...draft, max_streams: Number(event.target.value || 8) });
-              }}
-            />
-          </label>
-          <label className="field">
             無通信で待機表示にする秒数
             <input
               type="number"
@@ -430,7 +547,7 @@ function SettingsScreen({
                 setDraft({ ...draft, idle_timeout_secs: Number(event.target.value || 5) });
               }}
             />
-            <span className="hint">受信が止まっても出力は閉じません。この秒数を過ぎると「待機」になります。</span>
+            <span className="hint">受信が止まっても出力は閉じません。この秒数を過ぎると「待機」になります。受信スロット数は、次に接続したときから使われます。</span>
           </label>
         </section>
         <section className="settings-card" hidden={tab !== "limits"}>
@@ -515,16 +632,38 @@ export default function App() {
     return next;
   };
 
-  const toggleVoice = async (mute: boolean, deaf: boolean) => {
-    await invoke("set_voice_flags", { selfMute: mute, selfDeaf: deaf });
-    setSettings((current) => (current ? { ...current, self_mute: mute, self_deaf: deaf } : current));
+  const toggleDeaf = async (deaf: boolean) => {
+    await invoke("set_voice_flags", { selfDeaf: deaf });
+    setSettings((current) => (current ? { ...current, self_deaf: deaf } : current));
   };
 
-  const addOutput = async (name: string, transport: string) => {
+  const addOutput = async (name: string, kind: string, transport: string) => {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("名前を入力してください");
-    await invoke("add_output", { name: trimmed, transport });
+    await invoke("add_output", { name: trimmed, kind, transport });
     await refreshSettings();
+  };
+
+  const setMember = async (outputId: string, channelId: string, userId: string, volume: number, included: boolean) => {
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        outputs: current.outputs.map((output) => {
+          if (output.id !== outputId) return output;
+          const members = (output.members || []).filter((member) => !(member.channel_id === channelId && member.user_id === userId));
+          if (included) members.push({ channel_id: channelId, user_id: userId, volume });
+          return { ...output, members };
+        }),
+      };
+    });
+    try {
+      await invoke("set_audio_member", { outputId, channelId, userId, volume, included });
+      await refreshSettings();
+    } catch (err) {
+      await refreshSettings();
+      fail(err);
+    }
   };
 
   const renameOutput = async (outputId: string, name: string) => {
@@ -587,6 +726,25 @@ export default function App() {
     if (!confirm(`「${output.name || "この出力"}」を削除します。LAN 上のソースも閉じます。`)) return;
     await invoke("remove_output", { outputId: output.id });
     await refreshSettings();
+  };
+
+  const setPlayback = async (outputId: string, device: string, channelStart: number, channelCount: number) => {
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        outputs: current.outputs.map((output) =>
+          output.id === outputId ? { ...output, device, channel_start: channelStart, channel_count: channelCount } : output,
+        ),
+      };
+    });
+    try {
+      await invoke("set_output_playback", { outputId, device, channelStart, channelCount });
+      await refreshSettings();
+    } catch (err) {
+      await refreshSettings();
+      fail(err);
+    }
   };
 
   const openDiscordLogin = async () => {
@@ -817,9 +975,9 @@ export default function App() {
     <Matrix
       snapshot={snapshot}
       settings={settings}
-      onAdd={async (name, transport) => {
+      onAdd={async (name, kind, transport) => {
         try {
-          await addOutput(name, transport);
+          await addOutput(name, kind, transport);
         } catch (err) {
           fail(err);
           throw err;
@@ -828,6 +986,8 @@ export default function App() {
       onRename={renameOutput}
       onTransport={transportOutput}
       onRoute={routeOutput}
+      onPlayback={setPlayback}
+      onMember={setMember}
       onRemove={(output) => run(() => removeOutput(output))}
     />
   );
@@ -865,8 +1025,7 @@ export default function App() {
         }
         onPick={setPicked}
         onLeave={(guildId, channelId) => run(() => invoke("leave_voice", { guildId, channelId }))}
-        onToggleMute={() => run(() => toggleVoice(!snapshot.self_mute, snapshot.self_deaf))}
-        onToggleDeaf={() => run(() => toggleVoice(snapshot.self_mute, !snapshot.self_deaf))}
+        onToggleDeaf={() => run(() => toggleDeaf(!snapshot.self_deaf))}
         onOpenSettings={() =>
           run(async () => {
             await refreshSettings();
@@ -949,7 +1108,6 @@ function ChannelColumn({
   onChannel,
   onPick,
   onLeave,
-  onToggleMute,
   onToggleDeaf,
   onOpenSettings,
   onOpenLogs,
@@ -961,7 +1119,6 @@ function ChannelColumn({
   onChannel: (channel: { guildId: string; channelId: string; kind: string }) => void;
   onPick: (picked: Picked) => void;
   onLeave: (guildId: string, channelId: string) => void;
-  onToggleMute: () => void;
   onToggleDeaf: () => void;
   onOpenSettings: () => void;
   onOpenLogs: () => void;
@@ -997,7 +1154,7 @@ function ChannelColumn({
       <div className="guild-name">{guild ? guild.name : "ホーム"}</div>
       {snapshot.last_error ? <div className="banner">{snapshot.last_error}</div> : null}
       <div className="channel-scroll">{body}</div>
-      <VoiceBar snapshot={snapshot} onLeave={onLeave} onToggleMute={onToggleMute} onToggleDeaf={onToggleDeaf} />
+      <VoiceBar snapshot={snapshot} onLeave={onLeave} onToggleDeaf={onToggleDeaf} />
       <div className="user-panel">
         <div className="avatar-wrap">
           <Avatar id={user ? user.id : "0"} hash={user?.avatar || null} name={user ? user.name : "未接続"} />
@@ -1007,9 +1164,6 @@ function ChannelColumn({
           <div className="name">{user ? user.name : "未接続"}</div>
           <div className="status">{phaseLabel(snapshot.phase)}</div>
         </div>
-        <button className={snapshot.self_mute ? "icon-button toggled" : "icon-button"} type="button" title="ミュート" onClick={onToggleMute}>
-          <IconMic muted={snapshot.self_mute} />
-        </button>
         <button className={snapshot.self_deaf ? "icon-button toggled" : "icon-button"} type="button" title="スピーカーミュート" onClick={onToggleDeaf}>
           <IconHeadphones deaf={snapshot.self_deaf} />
         </button>
@@ -1069,12 +1223,10 @@ function ChannelRow({
 function VoiceBar({
   snapshot,
   onLeave,
-  onToggleMute,
   onToggleDeaf,
 }: {
   snapshot: Snapshot;
   onLeave: (guildId: string, channelId: string) => void;
-  onToggleMute: () => void;
   onToggleDeaf: () => void;
 }) {
   if (!snapshot.seats.length) return null;
@@ -1097,9 +1249,6 @@ function VoiceBar({
         );
       })}
       <div className="row">
-        <button className={snapshot.self_mute ? "icon-button toggled" : "icon-button"} type="button" title="ミュート" onClick={onToggleMute}>
-          <IconMic muted={snapshot.self_mute} />
-        </button>
         <button className={snapshot.self_deaf ? "icon-button toggled" : "icon-button"} type="button" title="スピーカーミュート" onClick={onToggleDeaf}>
           <IconHeadphones deaf={snapshot.self_deaf} />
         </button>

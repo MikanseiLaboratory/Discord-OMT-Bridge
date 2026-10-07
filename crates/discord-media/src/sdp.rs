@@ -205,10 +205,10 @@ pub fn synthesize_answer(
             out.push_str(&format!("a={candidate}\r\n"));
         }
         out.push_str("a=rtcp-mux\r\n");
+        let first_audio = section.kind == "audio" && audio_index == 0;
         let assigned = if section.kind == "audio" {
-            let stream = audio.get(audio_index).copied();
             audio_index += 1;
-            stream
+            None
         } else if section.kind == "video" {
             let stream = video.get(video_index).copied();
             video_index += 1;
@@ -216,7 +216,15 @@ pub fn synthesize_answer(
         } else {
             None
         };
-        let direction = answer_direction(&section.direction, assigned.is_some());
+        // The first audio m-line stays sendonly even before an SSRC is known.
+        // inactive tells the SFU not to forward Opus at all.
+        let direction = if first_audio {
+            "sendonly"
+        } else if section.kind == "audio" {
+            "inactive"
+        } else {
+            answer_direction(&section.direction, assigned.is_some())
+        };
         out.push_str(&format!("a={direction}\r\n"));
         for line in local_offer.lines() {
             let line = line.trim();
@@ -240,15 +248,21 @@ pub fn synthesize_answer(
                 out.push_str("a=maxptime:60\r\n");
             }
         }
+        if first_audio {
+            for stream in audio {
+                let label = format!("a{}-{}", stream.user_id, stream.ssrc);
+                out.push_str(&format!("a=msid:{label} {label}\r\n"));
+                out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.ssrc));
+            }
+        }
         if let Some(stream) = assigned {
-            let sentinel = if section.kind == "video" { "v" } else { "a" };
-            let label = format!("{sentinel}{}-{}", stream.user_id, stream.ssrc);
+            let label = format!("v{}-{}", stream.user_id, stream.ssrc);
             out.push_str(&format!("a=msid:{label} {label}\r\n"));
-            if section.kind == "video" && stream.rtx != 0 {
+            if stream.rtx != 0 {
                 out.push_str(&format!("a=ssrc-group:FID {} {}\r\n", stream.ssrc, stream.rtx));
             }
             out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.ssrc));
-            if section.kind == "video" && stream.rtx != 0 {
+            if stream.rtx != 0 {
                 out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.rtx));
             }
         }
@@ -348,13 +362,21 @@ c=IN IP4 127.0.0.1\r
         let answer = synthesize_answer(
             OFFER,
             server,
-            &[],
+            &[
+                AssignedSsrc { user_id: 1, ssrc: 11, rtx: 0 },
+                AssignedSsrc { user_id: 2, ssrc: 22, rtx: 0 },
+            ],
             &[AssignedSsrc { user_id: 7, ssrc: 42, rtx: 43 }],
         )
         .unwrap();
         assert_eq!(answer.matches("m=").count(), 2);
         assert!(answer.contains("a=ssrc:42 cname:v7-42"));
         assert!(answer.contains("a=ssrc-group:FID 42 43"));
+        let audio = answer.split("m=video").next().unwrap_or("");
+        assert!(audio.contains("a=sendonly"));
+        assert!(audio.contains("a=ssrc:11 cname:a1-11"));
+        assert!(audio.contains("a=ssrc:22 cname:a2-22"));
+        assert!(!audio.contains("a=inactive"));
         let video = answer.split("m=video").nth(1).unwrap_or("");
         assert!(video.contains("a=sendonly"));
         assert!(answer.contains("a=setup:passive"));

@@ -8,4 +8,6 @@ pub enum EgressError {
     Ndi(String),
     #[error("invalid frame: {0}")]
     InvalidFrame(&'static str),
+    #[error("audio: {0}")]
+    Audio(String),
 }

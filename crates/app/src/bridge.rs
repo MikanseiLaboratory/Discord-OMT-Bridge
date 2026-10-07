@@ -38,11 +38,29 @@ pub enum ControlCommand {
         name: String,
         kind: String,
         transport: String,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
         reply: oneshot::Sender<Result<(), String>>,
     },
     SetTransport {
         id: String,
         transport: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SetPlayback {
+        id: String,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SetAudioMember {
+        slot_id: String,
+        channel_id: u64,
+        user_id: u64,
+        volume: u16,
+        included: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     RemoveOutput {
@@ -102,13 +120,25 @@ impl BridgeHandle {
             .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
     }
 
-    pub fn add_output(&self, id: String, name: String, kind: String, transport: String) -> Result<(), String> {
+    pub fn add_output(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        transport: String,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
+    ) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
         self.send(ControlCommand::AddOutput {
             id,
             name,
             kind,
             transport,
+            device,
+            channel_start,
+            channel_count,
             reply,
         })?;
         waiter
@@ -127,6 +157,42 @@ impl BridgeHandle {
     pub fn set_transport(&self, id: String, transport: String) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
         self.send(ControlCommand::SetTransport { id, transport, reply })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn set_audio_member(
+        &self,
+        slot_id: String,
+        channel_id: u64,
+        user_id: u64,
+        volume: u16,
+        included: bool,
+    ) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::SetAudioMember {
+            slot_id,
+            channel_id,
+            user_id,
+            volume,
+            included,
+            reply,
+        })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn set_playback(&self, id: String, device: String, channel_start: u16, channel_count: u16) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::SetPlayback {
+            id,
+            device,
+            channel_start,
+            channel_count,
+            reply,
+        })?;
         waiter
             .blocking_recv()
             .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
@@ -310,6 +376,8 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
     let mut self_id = 0u64;
     let mut monitor = interval(Duration::from_secs(5));
     let mut idle = interval(Duration::from_secs(1));
+    let mut mix = interval(Duration::from_millis(20));
+    mix.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         publish_mut(&session, &world, &media, &mut router);
@@ -330,6 +398,9 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                     media.discard_until = None;
                     pump_joins(&world, &mut media, &commands, &session.config).await?;
                 }
+            }
+            _ = mix.tick() => {
+                router.pump_audio();
             }
             command = control.recv() => {
                 match command {
@@ -387,10 +458,31 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         }
                         let _ = reply.send(result);
                     }
-                    Some(ControlCommand::AddOutput { id, name, kind, transport, reply }) => {
+                    Some(ControlCommand::AddOutput {
+                        id,
+                        name,
+                        kind,
+                        transport,
+                        device,
+                        channel_start,
+                        channel_count,
+                        reply,
+                    }) => {
                         let result = SourceKind::parse(&kind).and_then(|parsed| {
-                            Transport::parse(&transport)
-                                .and_then(|transport| router.add_output(id, name, parsed, transport, 0, 0))
+                            Transport::parse(&transport).and_then(|transport| {
+                                router.add_output(
+                                    id,
+                                    name,
+                                    parsed,
+                                    transport,
+                                    0,
+                                    0,
+                                    device,
+                                    channel_start,
+                                    channel_count,
+                                    Vec::new(),
+                                )
+                            })
                         });
                         if let Err(err) = &result {
                             world.last_error = Some(err.clone());
@@ -411,6 +503,33 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         }
                         let _ = reply.send(result);
                     }
+                    Some(ControlCommand::SetPlayback {
+                        id,
+                        device,
+                        channel_start,
+                        channel_count,
+                        reply,
+                    }) => {
+                        let result = router.set_playback(&id, device, channel_start, channel_count);
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(ControlCommand::SetAudioMember {
+                        slot_id,
+                        channel_id,
+                        user_id,
+                        volume,
+                        included,
+                        reply,
+                    }) => {
+                        let result = router.set_audio_member(&slot_id, channel_id, user_id, volume, included);
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
                     Some(ControlCommand::RenameOutput { id, name, reply }) => {
                         let result = router.rename(&id, name);
                         if let Err(err) = &result {
@@ -422,10 +541,9 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         let _ = reply.send(router.preview_frames());
                     }
                     Some(ControlCommand::Apply(runtime)) => {
-                        let mute_changed = runtime.self_mute != session.config.self_mute
-                            || runtime.self_deaf != session.config.self_deaf;
+                        let deaf_changed = runtime.self_deaf != session.config.self_deaf;
                         session.config.apply_runtime(&runtime);
-                        if mute_changed {
+                        if deaf_changed {
                             media.mute_pending = true;
                             pump_joins(&world, &mut media, &commands, &session.config).await?;
                         }
@@ -666,7 +784,7 @@ async fn send_join(
         .send(GatewayCommand::JoinVoice {
             guild_id,
             channel_id,
-            self_mute: config.self_mute,
+            self_mute: true,
             self_deaf: config.self_deaf,
         })
         .await?;
@@ -707,7 +825,6 @@ fn publish_mut(session: &Session, world: &World, media: &MediaState, router: &mu
         &seats,
         &slots,
         world.last_error.as_deref(),
-        session.config.self_mute,
         session.config.self_deaf,
     );
     let _ = sender.send(snapshot);
@@ -802,6 +919,13 @@ async fn handle_gateway(
             }
             pump_joins(world, media, commands, config).await?;
         }
+        GatewayEvent::Resumed => {
+            world.ready = true;
+            world.reconnecting = false;
+            world.last_error = None;
+            tracing::info!("gateway resumed");
+            pump_joins(world, media, commands, config).await?;
+        }
         GatewayEvent::GuildUpsert(guild) => {
             upsert_guild(&mut world.guilds, guild);
             consider_autojoin(world, media);
@@ -884,10 +1008,6 @@ async fn handle_gateway(
             if paused || !config.allows(user_id) {
                 return Ok(());
             }
-            if media.streams.len() >= config.max_streams && !media.streams.contains_key(&stream_key) {
-                tracing::warn!(%stream_key, "Go Live watch limit reached");
-                return Ok(());
-            }
             commands.send(GatewayCommand::WatchStream { stream_key }).await?;
         }
         GatewayEvent::StreamAvailable(endpoint) => {
@@ -896,10 +1016,6 @@ async fn handle_gateway(
             }
             media.stream_endpoints.insert(endpoint.stream_key.clone(), endpoint.clone());
             if media.streams.contains_key(&endpoint.stream_key) {
-                return Ok(());
-            }
-            if media.streams.len() >= config.max_streams {
-                tracing::warn!(stream_key = %endpoint.stream_key, "Go Live watch limit reached");
                 return Ok(());
             }
             let Some((guild_id, channel_id, _)) = discord_user_gateway::parse_stream_key(&endpoint.stream_key) else {
@@ -932,18 +1048,25 @@ async fn handle_gateway(
                 handle.cancel.cancel();
             }
         }
-        GatewayEvent::Disconnected { reason } => {
-            tracing::warn!(%reason, "gateway disconnected; it will retry");
+        GatewayEvent::Disconnected { reason, resumable } => {
+            tracing::warn!(%reason, resumable, "gateway disconnected; it will retry");
             world.reconnecting = true;
-            world.ready = false;
             world.last_error = Some(reason);
+            if resumable {
+                return Ok(());
+            }
+            world.ready = false;
             media.awaiting = None;
             media.discard_until = None;
+            let pending: Vec<(u64, u64)> = media.seats.iter().map(|seat| (seat.guild_id, seat.channel_id)).collect();
             for seat in &mut media.seats {
                 seat.connected = false;
                 if let Some(handle) = seat.voice.take() {
                     handle.cancel.cancel();
                 }
+            }
+            for (guild_id, channel_id) in pending {
+                enqueue(media, guild_id, channel_id);
             }
             for (_, handle) in media.streams.drain() {
                 handle.cancel.cancel();
@@ -1050,7 +1173,7 @@ fn start_voice(
         channel_id,
         kind: MediaKind::Voice,
         max_video_slots: config.max_video_slots,
-        prefer_quality: config.prefer_quality,
+        prefer_quality: 100,
     });
     forward_media(handle, bus_tx, VoiceRoute::Channel(channel_id))
 }
@@ -1089,7 +1212,7 @@ fn start_stream(
         channel_id,
         kind: MediaKind::GoLive,
         max_video_slots: config.max_video_slots,
-        prefer_quality: config.prefer_quality,
+        prefer_quality: 100,
     });
     tracing::info!(stream_key = %key, user_id = endpoint.user_id, "watching Go Live");
     forward_media(handle, bus_tx, VoiceRoute::Stream(key))

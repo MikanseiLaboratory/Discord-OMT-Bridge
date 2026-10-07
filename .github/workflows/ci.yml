@@ -1,0 +1,16 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nasm and build tools
+        run: sudo apt-get update && sudo apt-get install -y nasm pkg-config libclang-dev build-essential cmake
+      - name: Test workspace without the desktop app
+        run: cargo test --workspace --exclude discord-omt-desktop --no-default-features

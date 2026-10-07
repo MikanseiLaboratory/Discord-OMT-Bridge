@@ -61,7 +61,7 @@ pub struct Snapshot {
     pub slots: Vec<SlotView>,
     pub last_error: Option<String>,
     pub ndi_available: bool,
-    pub self_mute: bool,
+    pub asio_available: bool,
     pub self_deaf: bool,
 }
 
@@ -142,7 +142,7 @@ impl Snapshot {
             slots: Vec::new(),
             last_error: None,
             ndi_available: crate::ndi_compiled(),
-            self_mute: true,
+            asio_available: crate::asio_compiled(),
             self_deaf: false,
         }
     }
@@ -157,7 +157,6 @@ pub fn capture(
     seats: &[SeatInput],
     slots: &[SlotSnapshot],
     last_error: Option<&str>,
-    self_mute: bool,
     self_deaf: bool,
 ) -> Snapshot {
     let guilds = guilds
@@ -232,7 +231,7 @@ pub fn capture(
             .collect(),
         last_error: last_error.map(str::to_owned),
         ndi_available: crate::ndi_compiled(),
-        self_mute,
+        asio_available: crate::asio_compiled(),
         self_deaf,
     }
 }

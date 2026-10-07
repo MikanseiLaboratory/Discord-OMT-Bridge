@@ -478,12 +478,22 @@ button:disabled { opacity: 0.45; cursor: default; }
 .slot-actions { display: flex; gap: 6px; margin-top: 8px; }
 .slot-actions button { flex: 1; }
 .source-scroll .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 8px; }
-.matrix { max-width: 420px; }
+.matrix { max-width: none; }
 .matrix input, .matrix select { user-select: text; margin-top: 0; }
-.matrix-add, .source-card { display: flex; flex-direction: column; gap: 6px; }
-.matrix-add { margin-bottom: 12px; }
-.matrix-label { color: var(--muted); font-size: 12px; font-weight: 700; }
-.matrix .primary, .matrix .secondary { width: 100%; }
+.matrix-list { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+.matrix-add, .source-card { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
+.matrix-add { margin-bottom: 8px; }
+.matrix-label { display: none; }
+.matrix .primary, .matrix .secondary { width: auto; }
+.source-card { margin-bottom: 0; }
+.source-card input[type="text"] { width: 148px; flex: 0 1 148px; }
+.source-card select { width: auto; max-width: 220px; flex: 0 1 180px; }
+.source-card .channel-field { width: 72px; flex: 0 0 72px; }
+.source-card .meta { flex: 1 1 160px; }
+.source-card .member-row { flex: 1 0 100%; display: flex; align-items: center; gap: 8px; }
+.source-card .member-row span:first-child { flex: 0 1 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-card .member-row input[type="range"] { flex: 1 1 120px; width: auto; }
+.source-card .member-row .volume { flex: 0 0 48px; color: var(--muted); font-size: 12px; }
 
 .settings {
   height: 100%;

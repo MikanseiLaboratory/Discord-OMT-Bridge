@@ -4,8 +4,8 @@ use std::sync::Mutex;
 mod logs;
 
 use discord_omt_bridge::{
-    default_settings_path, login_password, send_login_sms, spawn_session, submit_mfa, AuthStep, BridgeHandle,
-    CaptchaAnswer, OutputRoute, PreviewFrame, Settings, Snapshot, SourceKind, Transport,
+    default_settings_path, list_output_devices, login_password, send_login_sms, spawn_session, submit_mfa, AuthStep,
+    AudioSource, BridgeHandle, CaptchaAnswer, OutputRoute, PreviewFrame, Settings, Snapshot, SourceKind, Transport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindowBuilder};
@@ -18,20 +18,11 @@ struct AppState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SettingsDto {
     token: String,
-    self_mute: bool,
     self_deaf: bool,
-    enable_omt: bool,
-    enable_ndi: bool,
-    source_prefix: String,
     allow_user_ids: Vec<String>,
     deny_user_ids: Vec<String>,
-    max_streams: u32,
     max_video_slots: u32,
-    prefer_quality: u32,
     idle_timeout_secs: u64,
-    audio_slots: u32,
-    camera_slots: u32,
-    golive_slots: u32,
     client_build_number: u32,
     #[serde(default)]
     outputs: Vec<OutputDto>,
@@ -47,10 +38,38 @@ struct OutputDto {
     user_id: String,
     #[serde(default = "default_saved_transport")]
     transport: String,
+    #[serde(default)]
+    device: String,
+    #[serde(default = "default_channel_start")]
+    channel_start: u16,
+    #[serde(default = "default_channel_count")]
+    channel_count: u16,
+    #[serde(default)]
+    members: Vec<AudioMemberDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AudioMemberDto {
+    channel_id: String,
+    user_id: String,
+    #[serde(default = "default_volume")]
+    volume: u16,
+}
+
+fn default_volume() -> u16 {
+    100
 }
 
 fn default_saved_transport() -> String {
     "omt".into()
+}
+
+fn default_channel_start() -> u16 {
+    1
+}
+
+fn default_channel_count() -> u16 {
+    2
 }
 
 fn parse_ids(values: &[String]) -> Result<Vec<u64>, String> {
@@ -69,20 +88,11 @@ fn parse_ids(values: &[String]) -> Result<Vec<u64>, String> {
 fn to_dto(settings: &Settings, path: &PathBuf) -> SettingsDto {
     SettingsDto {
         token: settings.token.clone(),
-        self_mute: settings.self_mute,
         self_deaf: settings.self_deaf,
-        enable_omt: settings.enable_omt,
-        enable_ndi: settings.enable_ndi,
-        source_prefix: settings.source_prefix.clone(),
         allow_user_ids: settings.allow_user_ids.iter().map(|id| id.to_string()).collect(),
         deny_user_ids: settings.deny_user_ids.iter().map(|id| id.to_string()).collect(),
-        max_streams: settings.max_streams as u32,
         max_video_slots: settings.max_video_slots as u32,
-        prefer_quality: settings.prefer_quality,
         idle_timeout_secs: settings.idle_timeout_secs,
-        audio_slots: settings.audio_slots as u32,
-        camera_slots: settings.camera_slots as u32,
-        golive_slots: settings.golive_slots as u32,
         client_build_number: settings.client_build_number,
         outputs: settings
             .outputs
@@ -94,6 +104,18 @@ fn to_dto(settings: &Settings, path: &PathBuf) -> SettingsDto {
                 channel_id: output.channel_id.to_string(),
                 user_id: output.user_id.to_string(),
                 transport: output.transport.clone(),
+                device: output.device.clone(),
+                channel_start: output.channel_start,
+                channel_count: output.channel_count,
+                members: output
+                    .members
+                    .iter()
+                    .map(|member| AudioMemberDto {
+                        channel_id: member.channel_id.to_string(),
+                        user_id: member.user_id.to_string(),
+                        volume: member.volume,
+                    })
+                    .collect(),
             })
             .collect(),
         path: path.display().to_string(),
@@ -103,20 +125,11 @@ fn to_dto(settings: &Settings, path: &PathBuf) -> SettingsDto {
 fn from_dto(dto: &SettingsDto) -> Result<Settings, String> {
     Ok(Settings {
         token: dto.token.trim().to_owned(),
-        self_mute: dto.self_mute,
         self_deaf: dto.self_deaf,
-        enable_omt: dto.enable_omt,
-        enable_ndi: dto.enable_ndi,
-        source_prefix: dto.source_prefix.trim().to_owned(),
         allow_user_ids: parse_ids(&dto.allow_user_ids)?,
         deny_user_ids: parse_ids(&dto.deny_user_ids)?,
-        max_streams: dto.max_streams.max(1) as usize,
         max_video_slots: dto.max_video_slots.clamp(1, 32) as usize,
-        prefer_quality: dto.prefer_quality.min(100),
         idle_timeout_secs: dto.idle_timeout_secs.max(1),
-        audio_slots: dto.audio_slots.min(32) as usize,
-        camera_slots: dto.camera_slots.min(32) as usize,
-        golive_slots: dto.golive_slots.min(32) as usize,
         client_build_number: dto.client_build_number,
         outputs: outputs_from_dto(&dto.outputs)?,
     })
@@ -153,9 +166,37 @@ fn outputs_from_dto(values: &[OutputDto]) -> Result<Vec<OutputRoute>, String> {
             channel_id: parse_route_id(&output.channel_id)?,
             user_id: parse_route_id(&output.user_id)?,
             transport,
+            device: output.device.trim().to_owned(),
+            channel_start: output.channel_start.max(1),
+            channel_count: output.channel_count.clamp(1, 64),
+            members: members_from_dto(&output.members)?,
         });
     }
     Ok(outputs)
+}
+
+fn members_from_dto(values: &[AudioMemberDto]) -> Result<Vec<AudioSource>, String> {
+    let mut members = Vec::with_capacity(values.len());
+    for member in values {
+        let channel_id = parse_route_id(&member.channel_id)?;
+        let user_id = parse_route_id(&member.user_id)?;
+        if channel_id == 0 || user_id == 0 {
+            continue;
+        }
+        if members.iter().any(|existing: &AudioSource| existing.channel_id == channel_id && existing.user_id == user_id) {
+            continue;
+        }
+        members.push(AudioSource {
+            channel_id,
+            user_id,
+            volume: member.volume.min(200),
+        });
+    }
+    Ok(members)
+}
+
+fn video_kind(kind: &str) -> bool {
+    matches!(kind, "camera" | "golive")
 }
 
 fn new_output_id(existing: &[OutputRoute]) -> String {
@@ -263,13 +304,16 @@ fn clear_slot(state: State<'_, AppState>, slot_id: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn add_output(state: State<'_, AppState>, name: String, transport: String) -> Result<String, String> {
+fn add_output(state: State<'_, AppState>, name: String, kind: String, transport: String) -> Result<String, String> {
     let name = name.trim().to_owned();
     if name.is_empty() {
         return Err("名前を入力してください".into());
     }
+    let kind = SourceKind::parse(&kind)?.slug().to_owned();
     let transport = Transport::parse(&transport)?.slug().to_owned();
-    let kind = SourceKind::Audio.slug().to_owned();
+    if video_kind(&kind) && matches!(transport.as_str(), "device" | "asio") {
+        return Err("映像の出し先は OMT か NDI です".into());
+    }
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
     if settings.outputs.len() >= 64 {
         return Err("出力は64個までです".into());
@@ -279,7 +323,7 @@ fn add_output(state: State<'_, AppState>, name: String, transport: String) -> Re
     }
     let id = new_output_id(&settings.outputs);
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
-        if let Err(err) = handle.add_output(id.clone(), name.clone(), kind.clone(), transport.clone()) {
+        if let Err(err) = handle.add_output(id.clone(), name.clone(), kind.clone(), transport.clone(), String::new(), 1, 2) {
             return Err(err);
         }
     }
@@ -290,6 +334,10 @@ fn add_output(state: State<'_, AppState>, name: String, transport: String) -> Re
         channel_id: 0,
         user_id: 0,
         transport,
+        device: String::new(),
+        channel_start: 1,
+        channel_count: 2,
+        members: Vec::new(),
     });
     if let Err(err) = settings.save(&state.settings_path) {
         if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
@@ -385,6 +433,9 @@ fn set_output_transport(state: State<'_, AppState>, output_id: String, transport
     if settings.outputs[index].transport == transport {
         return Ok(());
     }
+    if video_kind(&settings.outputs[index].kind) && matches!(transport.as_str(), "device" | "asio") {
+        return Err("映像の出し先は OMT か NDI です".into());
+    }
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.set_transport(output_id, transport.clone())?;
     }
@@ -393,14 +444,86 @@ fn set_output_transport(state: State<'_, AppState>, output_id: String, transport
 }
 
 #[tauri::command]
+fn set_output_playback(
+    state: State<'_, AppState>,
+    output_id: String,
+    device: String,
+    channel_start: u16,
+    channel_count: u16,
+) -> Result<(), String> {
+    let device = device.trim().to_owned();
+    let channel_start = channel_start.max(1);
+    let channel_count = channel_count.clamp(1, 64);
+    let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
+    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+        return Err("出力が見つかりません".into());
+    };
+    if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
+        handle.set_playback(output_id, device.clone(), channel_start, channel_count)?;
+    }
+    settings.outputs[index].device = device;
+    settings.outputs[index].channel_start = channel_start;
+    settings.outputs[index].channel_count = channel_count;
+    settings.save(&state.settings_path).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_audio_member(
+    state: State<'_, AppState>,
+    output_id: String,
+    channel_id: String,
+    user_id: String,
+    volume: u16,
+    included: bool,
+) -> Result<(), String> {
+    let channel_id = parse_route_id(&channel_id)?;
+    let user_id = parse_route_id(&user_id)?;
+    let volume = volume.min(200);
+    let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
+    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+        return Err("出力が見つかりません".into());
+    };
+    if settings.outputs[index].kind != "audio" {
+        return Err("人の割り当ては音声出力だけです".into());
+    }
+    if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
+        handle.set_audio_member(output_id, channel_id, user_id, volume, included)?;
+    }
+    let members = &mut settings.outputs[index].members;
+    members.retain(|member| !(member.channel_id == channel_id && member.user_id == user_id));
+    if included && channel_id != 0 && user_id != 0 {
+        members.push(AudioSource { channel_id, user_id, volume });
+    }
+    settings.save(&state.settings_path).map_err(|err| err.to_string())
+}
+
+#[derive(Serialize)]
+struct PlaybackDeviceDto {
+    name: String,
+    host: String,
+    channels: u16,
+}
+
+#[tauri::command]
+fn playback_devices() -> Vec<PlaybackDeviceDto> {
+    list_output_devices()
+        .into_iter()
+        .map(|device| PlaybackDeviceDto {
+            name: device.name,
+            host: device.host.to_owned(),
+            channels: device.channels,
+        })
+        .collect()
+}
+
+#[tauri::command]
 fn recent_logs() -> Vec<logs::LogLine> {
     logs::recent()
 }
 
 #[tauri::command]
-fn set_voice_flags(state: State<'_, AppState>, self_mute: bool, self_deaf: bool) -> Result<(), String> {
+fn set_voice_flags(state: State<'_, AppState>, self_deaf: bool) -> Result<(), String> {
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    settings.self_mute = self_mute;
     settings.self_deaf = self_deaf;
     settings.to_config().map_err(|err| err.to_string())?;
     settings.save(&state.settings_path).map_err(|err| err.to_string())?;
@@ -734,6 +857,9 @@ pub fn run() {
             rename_output,
             set_output_route,
             set_output_transport,
+            set_output_playback,
+            set_audio_member,
+            playback_devices,
             recent_logs,
             set_voice_flags,
             discord_login,
