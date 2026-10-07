@@ -2,6 +2,26 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputRoute {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default, deserialize_with = "snowflake")]
+    pub channel_id: u64,
+    #[serde(default, deserialize_with = "snowflake")]
+    pub user_id: u64,
+    /// `omt` or `ndi`. Outputs saved before this field existed stay on OMT.
+    #[serde(default = "default_output_transport")]
+    pub transport: String,
+}
+
+fn default_output_transport() -> String {
+    "omt".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelTarget {
     #[serde(deserialize_with = "snowflake")]
@@ -24,7 +44,7 @@ pub struct Config {
     pub self_deaf: bool,
     #[serde(default = "default_true")]
     pub enable_omt: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enable_ndi: bool,
     #[serde(default = "default_prefix")]
     pub source_prefix: String,
@@ -48,6 +68,8 @@ pub struct Config {
     pub golive_slots: usize,
     #[serde(default)]
     pub client_build_number: u32,
+    #[serde(default)]
+    pub outputs: Vec<OutputRoute>,
 }
 
 fn default_true() -> bool {
@@ -186,7 +208,7 @@ pub struct Settings {
     pub self_deaf: bool,
     #[serde(default = "default_true")]
     pub enable_omt: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enable_ndi: bool,
     #[serde(default = "default_prefix")]
     pub source_prefix: String,
@@ -210,6 +232,8 @@ pub struct Settings {
     pub golive_slots: usize,
     #[serde(default)]
     pub client_build_number: u32,
+    #[serde(default)]
+    pub outputs: Vec<OutputRoute>,
 }
 
 impl Default for Settings {
@@ -219,7 +243,7 @@ impl Default for Settings {
             self_mute: true,
             self_deaf: false,
             enable_omt: true,
-            enable_ndi: false,
+            enable_ndi: true,
             source_prefix: default_prefix(),
             allow_user_ids: Vec::new(),
             deny_user_ids: Vec::new(),
@@ -231,6 +255,7 @@ impl Default for Settings {
             camera_slots: default_camera_slots(),
             golive_slots: default_golive_slots(),
             client_build_number: 0,
+            outputs: Vec::new(),
         }
     }
 }
@@ -310,6 +335,7 @@ impl Settings {
             camera_slots: self.camera_slots.clamp(0, 32),
             golive_slots: self.golive_slots.clamp(0, 32),
             client_build_number: self.client_build_number,
+            outputs: self.outputs.clone(),
         })
     }
 }
@@ -339,6 +365,7 @@ mod tests {
             camera_slots: 8,
             golive_slots: 4,
             client_build_number: 0,
+            outputs: Vec::new(),
         };
         assert!(!config.allows(5));
         assert!(!config.allows(9));
@@ -358,5 +385,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.channel_targets(), vec![(10, 20), (10, 21)]);
+        assert!(config.outputs.is_empty());
     }
 }

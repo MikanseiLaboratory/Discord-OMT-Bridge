@@ -4,6 +4,16 @@ use serde::Serialize;
 
 use crate::router::SlotSnapshot;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewFrame {
+    pub user_id: String,
+    pub name: String,
+    pub kind: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserState {
     pub id: u64,
@@ -171,7 +181,7 @@ pub fn capture(
                         .map(|member| MemberView {
                             id: member.user_id.to_string(),
                             name: if member.name.is_empty() {
-                                format!("user-{}", member.user_id)
+                                "取得中".into()
                             } else {
                                 member.name.clone()
                             },

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use egress::{AudioPublisher, FanoutPublisher, VideoPublisher};
 
 use crate::config::Config;
+use crate::snapshot::PreviewFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
@@ -21,11 +22,20 @@ impl SourceKind {
         }
     }
 
-    fn slug(self) -> &'static str {
+    pub fn slug(self) -> &'static str {
         match self {
             Self::Audio => "audio",
             Self::Camera => "camera",
             Self::GoLive => "golive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "audio" | "Audio" => Ok(Self::Audio),
+            "camera" | "Camera" => Ok(Self::Camera),
+            "golive" | "GoLive" => Ok(Self::GoLive),
+            _ => Err("種類は音声、カメラ、Go Live のいずれかです".into()),
         }
     }
 
@@ -34,6 +44,36 @@ impl SourceKind {
             Self::Audio => egress::SourceMode::AudioOnly,
             Self::Camera => egress::SourceMode::VideoOnly,
             Self::GoLive => egress::SourceMode::AudioAndVideo,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Omt,
+    Ndi,
+}
+
+impl Transport {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Omt => "omt",
+            Self::Ndi => "ndi",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "omt" | "OMT" | "" => Ok(Self::Omt),
+            "ndi" | "NDI" => Ok(Self::Ndi),
+            _ => Err("送出先は OMT か NDI です".into()),
+        }
+    }
+
+    fn flags(self) -> (bool, bool) {
+        match self {
+            Self::Omt => (true, false),
+            Self::Ndi => (false, true),
         }
     }
 }
@@ -70,6 +110,7 @@ struct Binding {
 struct OutputSlot {
     id: String,
     kind: SourceKind,
+    transport: Transport,
     name: String,
     publisher: FanoutPublisher,
     binding: Binding,
@@ -84,12 +125,21 @@ struct OutputSlot {
     height: u32,
 }
 
+struct PreviewSlot {
+    user_id: u64,
+    kind: SourceKind,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    at: Instant,
+}
+
 pub struct SourceRouter {
     slots: Vec<OutputSlot>,
     names: HashMap<u64, String>,
+    previews: Vec<PreviewSlot>,
     black: Vec<u8>,
     silence: Vec<i16>,
-    overflow: u64,
 }
 
 impl SourceRouter {
@@ -97,14 +147,25 @@ impl SourceRouter {
         let mut router = Self {
             slots: Vec::new(),
             names: HashMap::new(),
+            previews: Vec::new(),
             black: vec![0; 640 * 360 * 4],
             silence: vec![0; 960 * 2],
-            overflow: 0,
         };
-        router.add_kind(config, SourceKind::Audio, config.audio_slots)?;
-        router.add_kind(config, SourceKind::Camera, config.camera_slots)?;
-        router.add_kind(config, SourceKind::GoLive, config.golive_slots)?;
-        tracing::info!(slots = router.slots.len(), "opened persistent LAN slots");
+        for route in &config.outputs {
+            let kind = SourceKind::parse(&route.kind).map_err(anyhow::Error::msg)?;
+            let transport = Transport::parse(&route.transport).map_err(anyhow::Error::msg)?;
+            router
+                .add_output(
+                    route.id.clone(),
+                    route.name.clone(),
+                    kind,
+                    transport,
+                    route.channel_id,
+                    route.user_id,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        tracing::info!(outputs = router.slots.len(), "opened matrix outputs");
         Ok(router)
     }
 
@@ -128,16 +189,14 @@ impl SourceRouter {
             return;
         }
         let feed = FeedKey { channel_id, user_id, kind };
-        let Some(index) = claim_slot(&mut self.slots, feed) else {
-            self.overflow += 1;
-            return;
-        };
-        let slot = &mut self.slots[index];
-        if let Err(err) = slot.publisher.publish_audio(pcm, sample_rate, channels) {
-            slot.dropped += 1;
-            tracing::warn!(%err, slot = %slot.name, "audio publish failed");
-        } else {
-            slot.note_media();
+        for index in self.indexes_for(feed) {
+            let slot = &mut self.slots[index];
+            if let Err(err) = slot.publisher.publish_audio(pcm, sample_rate, channels) {
+                slot.dropped += 1;
+                tracing::warn!(%err, slot = %slot.name, "audio publish failed");
+            } else {
+                slot.note_media();
+            }
         }
     }
 
@@ -154,42 +213,135 @@ impl SourceRouter {
         if !config.allows(user_id) {
             return;
         }
+        self.remember_preview(user_id, kind, bgra, width, height);
         let feed = FeedKey { channel_id, user_id, kind };
-        let Some(index) = claim_slot(&mut self.slots, feed) else {
-            self.overflow += 1;
-            return;
-        };
-        let slot = &mut self.slots[index];
-        slot.width = width;
-        slot.height = height;
-        if let Err(err) = slot.publisher.publish_video(bgra, width, height, (30, 1)) {
-            slot.dropped += 1;
-            tracing::warn!(%err, slot = %slot.name, "video publish failed");
-        } else {
-            slot.note_media();
+        for index in self.indexes_for(feed) {
+            let slot = &mut self.slots[index];
+            slot.width = width;
+            slot.height = height;
+            if let Err(err) = slot.publisher.publish_video(bgra, width, height, (30, 1)) {
+                slot.dropped += 1;
+                tracing::warn!(%err, slot = %slot.name, "video publish failed");
+            } else {
+                slot.note_media();
+            }
         }
     }
 
-    pub fn assign(&mut self, slot_id: &str, channel_id: u64, user_id: u64) -> Result<(), String> {
-        let Some(index) = self.slots.iter().position(|slot| slot.id == slot_id) else {
-            return Err("スロットが見つかりません".into());
+    pub fn add_output(
+        &mut self,
+        id: String,
+        name: String,
+        kind: SourceKind,
+        transport: Transport,
+        channel_id: u64,
+        user_id: u64,
+    ) -> Result<(), String> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err("名前を入力してください".into());
+        }
+        if self.slots.len() >= 64 {
+            return Err("出力は64個までです".into());
+        }
+        if self.slots.iter().any(|slot| slot.id == id) {
+            return Err("同じ出力が既にあります".into());
+        }
+        if self.slots.iter().any(|slot| slot.name == name) {
+            return Err("同じ名前の出力があります".into());
+        }
+        let publisher = open_publisher(&name, kind, transport)?;
+        let assignment = route_feed(kind, channel_id, user_id);
+        tracing::info!(%name, kind = kind.slug(), transport = transport.slug(), "created output");
+        self.slots.push(OutputSlot {
+            id,
+            kind,
+            transport,
+            name,
+            publisher,
+            binding: Binding {
+                kind,
+                assignment,
+                pinned: assignment.is_some(),
+            },
+            frames: 0,
+            dropped: 0,
+            last_media: None,
+            last_output: Instant::now(),
+            window_start: Instant::now(),
+            window_frames: 0,
+            fps: 0.0,
+            width: 640,
+            height: 360,
+        });
+        Ok(())
+    }
+
+    pub fn remove_output(&mut self, id: &str) -> Result<(), String> {
+        let Some(index) = self.slots.iter().position(|slot| slot.id == id) else {
+            return Err("出力が見つかりません".into());
         };
-        let kind = self.slots[index].kind;
-        let feed = FeedKey { channel_id, user_id, kind };
-        for (other, slot) in self.slots.iter_mut().enumerate() {
-            if other != index && slot.binding.assignment == Some(feed) {
-                slot.binding.assignment = None;
-                slot.binding.pinned = false;
+        self.slots.remove(index);
+        Ok(())
+    }
+
+    pub fn rename(&mut self, id: &str, name: String) -> Result<(), String> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err("名前を入力してください".into());
+        }
+        if self.slots.iter().any(|slot| slot.name == name && slot.id != id) {
+            return Err("同じ名前の出力があります".into());
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) else {
+            return Err("出力が見つかりません".into());
+        };
+        if slot.name == name {
+            return Ok(());
+        }
+        let publisher = open_publisher(&name, slot.kind, slot.transport)?;
+        slot.publisher = publisher;
+        slot.name = name;
+        slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+        Ok(())
+    }
+
+    pub fn assign(
+        &mut self,
+        slot_id: &str,
+        channel_id: u64,
+        user_id: u64,
+        kind: Option<SourceKind>,
+    ) -> Result<(), String> {
+        let Some(index) = self.slots.iter().position(|slot| slot.id == slot_id) else {
+            return Err("出力が見つかりません".into());
+        };
+        if let Some(kind) = kind {
+            if self.slots[index].kind != kind {
+                self.reopen(index, kind, self.slots[index].transport)?;
             }
         }
-        self.slots[index].binding.assignment = Some(feed);
-        self.slots[index].binding.pinned = true;
+        let kind = self.slots[index].kind;
+        let assignment = route_feed(kind, channel_id, user_id);
+        self.slots[index].binding.assignment = assignment;
+        self.slots[index].binding.pinned = assignment.is_some();
         Ok(())
+    }
+
+    pub fn set_transport(&mut self, slot_id: &str, transport: Transport) -> Result<(), String> {
+        let Some(index) = self.slots.iter().position(|slot| slot.id == slot_id) else {
+            return Err("出力が見つかりません".into());
+        };
+        if self.slots[index].transport == transport {
+            return Ok(());
+        }
+        let kind = self.slots[index].kind;
+        self.reopen(index, kind, transport)
     }
 
     pub fn clear(&mut self, slot_id: &str) -> Result<(), String> {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == slot_id) else {
-            return Err("スロットが見つかりません".into());
+            return Err("出力が見つかりません".into());
         };
         slot.binding.assignment = None;
         slot.binding.pinned = false;
@@ -249,31 +401,77 @@ impl SourceRouter {
             .collect()
     }
 
-    fn add_kind(&mut self, config: &Config, kind: SourceKind, count: usize) -> anyhow::Result<()> {
-        for index in 1..=count {
-            let name = format!("{} / {} / {index}", config.source_prefix, kind.label());
-            let publisher = FanoutPublisher::open(&name, kind.mode(), config.enable_omt, config.enable_ndi)
-                .map_err(|err| anyhow::anyhow!(err))?;
-            tracing::info!(%name, "created output slot");
-            self.slots.push(OutputSlot {
-                id: format!("{}-{index}", kind.slug()),
+    pub fn preview_frames(&mut self) -> Vec<PreviewFrame> {
+        self.previews.retain(|slot| slot.at.elapsed() < Duration::from_secs(5));
+        self.previews
+            .iter()
+            .map(|slot| PreviewFrame {
+                user_id: slot.user_id.to_string(),
+                name: self
+                    .names
+                    .get(&slot.user_id)
+                    .cloned()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "取得中".into()),
+                kind: slot.kind.slug().to_owned(),
+                width: slot.width,
+                height: slot.height,
+                rgba: encode_base64(&slot.rgba),
+            })
+            .collect()
+    }
+
+    fn remember_preview(&mut self, user_id: u64, kind: SourceKind, bgra: &[u8], width: u32, height: u32) {
+        if let Some(slot) = self.previews.iter().find(|slot| slot.user_id == user_id && slot.kind == kind) {
+            if slot.at.elapsed() < Duration::from_millis(120) {
+                return;
+            }
+        }
+        let (width, height, rgba) = downscale_bgra_to_rgba(bgra, width, height, 480);
+        if rgba.is_empty() {
+            return;
+        }
+        if let Some(slot) = self.previews.iter_mut().find(|slot| slot.user_id == user_id && slot.kind == kind) {
+            slot.width = width;
+            slot.height = height;
+            slot.rgba = rgba;
+            slot.at = Instant::now();
+        } else {
+            self.previews.push(PreviewSlot {
+                user_id,
                 kind,
-                name,
-                publisher,
-                binding: Binding { kind, assignment: None, pinned: false },
-                frames: 0,
-                dropped: 0,
-                last_media: None,
-                last_output: Instant::now(),
-                window_start: Instant::now(),
-                window_frames: 0,
-                fps: 0.0,
-                width: 640,
-                height: 360,
+                width,
+                height,
+                rgba,
+                at: Instant::now(),
             });
         }
+    }
+
+    fn indexes_for(&self, feed: FeedKey) -> Vec<usize> {
+        let bindings: Vec<Binding> = self.slots.iter().map(|slot| slot.binding).collect();
+        routed(&bindings, feed)
+    }
+
+    fn reopen(&mut self, index: usize, kind: SourceKind, transport: Transport) -> Result<(), String> {
+        let name = self.slots[index].name.clone();
+        let publisher = open_publisher(&name, kind, transport)?;
+        let slot = &mut self.slots[index];
+        slot.kind = kind;
+        slot.binding.kind = kind;
+        slot.transport = transport;
+        slot.publisher = publisher;
+        slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
         Ok(())
     }
+}
+
+fn open_publisher(name: &str, kind: SourceKind, transport: Transport) -> Result<FanoutPublisher, String> {
+    let (omt, ndi) = transport.flags();
+    if ndi && !cfg!(feature = "ndi") {
+        return Err("NDI を使うには NDI 6 SDK を入れ、ndi 機能付きでビルドしてください".into());
+    }
+    FanoutPublisher::open(name, kind.mode(), omt, ndi).map_err(|err| err.to_string())
 }
 
 impl OutputSlot {
@@ -296,28 +494,33 @@ impl OutputSlot {
     }
 }
 
-fn claim_slot(slots: &mut [OutputSlot], feed: FeedKey) -> Option<usize> {
-    let mut bindings: Vec<Binding> = slots.iter().map(|slot| slot.binding).collect();
-    let index = claim(&mut bindings, feed)?;
-    for (slot, binding) in slots.iter_mut().zip(bindings) {
-        slot.binding = binding;
+fn route_feed(kind: SourceKind, channel_id: u64, user_id: u64) -> Option<FeedKey> {
+    if channel_id == 0 || user_id == 0 {
+        None
+    } else {
+        Some(FeedKey { channel_id, user_id, kind })
     }
-    Some(index)
 }
 
-fn claim(slots: &mut [Binding], feed: FeedKey) -> Option<usize> {
-    if let Some(index) = slots.iter().position(|slot| slot.assignment == Some(feed)) {
-        return Some(index);
-    }
-    let index = slots.iter().position(|slot| slot.kind == feed.kind && slot.assignment.is_none())?;
-    slots[index].assignment = Some(feed);
-    slots[index].pinned = false;
-    Some(index)
+fn routed(slots: &[Binding], feed: FeedKey) -> Vec<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.kind == feed.kind && slot.assignment == Some(feed))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+#[cfg(test)]
+fn pin(slots: &mut [Binding], index: usize, channel_id: u64, user_id: u64) {
+    let kind = slots[index].kind;
+    slots[index].assignment = Some(FeedKey { channel_id, user_id, kind });
+    slots[index].pinned = true;
 }
 
 pub fn log_sources(snapshots: &[SlotSnapshot]) {
     if snapshots.is_empty() {
-        tracing::info!("no output slots");
+        tracing::info!("no outputs");
         return;
     }
     for source in snapshots {
@@ -328,9 +531,56 @@ pub fn log_sources(snapshots: &[SlotSnapshot]) {
             frames = source.frames,
             dropped = source.dropped,
             fps = format!("{:.1}", source.fps),
-            "slot"
+            "output"
         );
     }
+}
+
+fn downscale_bgra_to_rgba(bgra: &[u8], width: u32, height: u32, max_width: u32) -> (u32, u32, Vec<u8>) {
+    let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    if width == 0 || height == 0 || bgra.len() < pixels {
+        return (0, 0, Vec::new());
+    }
+    let out_w = width.min(max_width).max(1);
+    let out_h = ((height as u64 * out_w as u64) / width as u64).max(1) as u32;
+    let mut rgba = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    for y in 0..out_h {
+        let src_y = (y as u64 * height as u64 / out_h as u64) as u32;
+        for x in 0..out_w {
+            let src_x = (x as u64 * width as u64 / out_w as u64) as u32;
+            let source = ((src_y * width + src_x) * 4) as usize;
+            let dest = ((y * out_w + x) * 4) as usize;
+            rgba[dest] = bgra[source + 2];
+            rgba[dest + 1] = bgra[source + 1];
+            rgba[dest + 2] = bgra[source];
+            rgba[dest + 3] = 255;
+        }
+    }
+    (out_w, out_h, rgba)
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -342,30 +592,44 @@ mod tests {
     }
 
     #[test]
-    fn assignment_stays_when_the_feed_returns() {
+    fn explicit_route_stays_when_the_feed_returns() {
         let mut slots = vec![empty(SourceKind::Camera), empty(SourceKind::Camera)];
         let alice = FeedKey { channel_id: 7, user_id: 1, kind: SourceKind::Camera };
-        assert_eq!(claim(&mut slots, alice), Some(0));
-        assert_eq!(claim(&mut slots, alice), Some(0));
-        let bob = FeedKey { channel_id: 7, user_id: 2, kind: SourceKind::Camera };
-        assert_eq!(claim(&mut slots, bob), Some(1));
-        assert_eq!(claim(&mut slots, alice), Some(0));
+        pin(&mut slots, 0, 7, 1);
+        assert_eq!(routed(&slots, alice), vec![0]);
+        assert_eq!(routed(&slots, alice), vec![0]);
     }
 
     #[test]
-    fn a_full_pool_does_not_steal_a_quiet_slot() {
+    fn unrouted_feed_does_not_occupy_an_output() {
+        let slots = vec![empty(SourceKind::Audio)];
+        let feed = FeedKey { channel_id: 1, user_id: 9, kind: SourceKind::Audio };
+        assert!(routed(&slots, feed).is_empty());
+    }
+
+    #[test]
+    fn the_same_feed_can_route_to_two_outputs() {
+        let mut slots = vec![empty(SourceKind::Camera), empty(SourceKind::Camera)];
+        pin(&mut slots, 0, 7, 1);
+        pin(&mut slots, 1, 7, 1);
+        let alice = FeedKey { channel_id: 7, user_id: 1, kind: SourceKind::Camera };
+        assert_eq!(routed(&slots, alice), vec![0, 1]);
+    }
+
+    #[test]
+    fn transport_parse_accepts_omt_and_ndi() {
+        assert_eq!(Transport::parse("omt").unwrap(), Transport::Omt);
+        assert_eq!(Transport::parse("NDI").unwrap(), Transport::Ndi);
+        assert!(Transport::parse("both").is_err());
+    }
+
+    #[test]
+    fn audio_output_ignores_a_camera_feed() {
         let mut slots = vec![empty(SourceKind::Audio)];
-        let first = FeedKey { channel_id: 1, user_id: 9, kind: SourceKind::Audio };
-        let second = FeedKey { channel_id: 1, user_id: 8, kind: SourceKind::Audio };
-        assert_eq!(claim(&mut slots, first), Some(0));
-        assert_eq!(claim(&mut slots, second), None);
-        assert_eq!(slots[0].assignment, Some(first));
-    }
-
-    #[test]
-    fn audio_and_camera_use_different_pools() {
-        let mut slots = vec![empty(SourceKind::Audio), empty(SourceKind::Camera)];
+        pin(&mut slots, 0, 1, 4);
         let camera = FeedKey { channel_id: 1, user_id: 4, kind: SourceKind::Camera };
-        assert_eq!(claim(&mut slots, camera), Some(1));
+        assert!(routed(&slots, camera).is_empty());
+        let audio = FeedKey { channel_id: 1, user_id: 4, kind: SourceKind::Audio };
+        assert_eq!(routed(&slots, audio), vec![0]);
     }
 }

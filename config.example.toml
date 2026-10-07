@@ -16,9 +16,9 @@ channel_id = "000000000000000000"
 self_mute = true
 self_deaf = false
 
-# NDI requires the NDI 6 SDK and a build with `--features ndi`.
+# NDI is included in the default build and needs the NDI 6 SDK at runtime.
 enable_omt = true
-enable_ndi = false
+enable_ndi = true
 
 source_prefix = "Discord"
 
@@ -30,13 +30,19 @@ deny_user_ids = []
 max_streams = 8
 # Receive transceivers allocated for remote video SSRCs.
 max_video_slots = 8
-# Persistent LAN senders. Created at connect and kept when a camera or Go Live stops.
-audio_slots = 8
-camera_slots = 8
-golive_slots = 4
+# Outputs start empty. Add them in the desktop window, or list them here.
+# name is the source name. transport is omt or ndi. kind is the selected input: audio, camera, or golive.
+# channel_id and user_id of 0 mean no input yet. The same input can feed several outputs.
+# [[outputs]]
+# id = "out-1"
+# name = "司会カメラ"
+# transport = "ndi"
+# kind = "camera"
+# channel_id = "0"
+# user_id = "0"
 # Preferred simulcast quality (0-100). Higher means a larger layer.
 prefer_quality = 100
-# Seconds without media before a slot is shown as idle. The sender stays open.
+# Seconds without media before an output is shown as idle. The sender stays open.
 idle_timeout_secs = 5
 
 # Override Discord's desktop client build number when Identify is rejected.

@@ -33,9 +33,9 @@ mod imp {
             frame_rate: (u32, u32),
         ) -> Result<(), EgressError> {
             let mut frame = VideoFrame::builder()
-                .resolution(width, height)
+                .resolution(ndi_i32(width)?, ndi_i32(height)?)
                 .pixel_format(PixelFormat::BGRA)
-                .frame_rate(frame_rate.0.max(1), frame_rate.1.max(1))
+                .frame_rate(ndi_i32(frame_rate.0.max(1))?, ndi_i32(frame_rate.1.max(1))?)
                 .build()
                 .map_err(|err| EgressError::Ndi(err.to_string()))?;
             let expected = (width as usize)
@@ -67,15 +67,19 @@ mod imp {
             let samples = (pcm.len() / channels as usize) as u32;
             let data: Vec<f32> = pcm.iter().map(|sample| *sample as f32 / i16::MAX as f32).collect();
             let frame = AudioFrame::builder()
-                .sample_rate(sample_rate)
-                .channels(channels as u32)
-                .samples(samples)
+                .sample_rate(ndi_i32(sample_rate)?)
+                .channels(ndi_i32(u32::from(channels))?)
+                .samples(ndi_i32(samples)?)
                 .data(data)
                 .build()
                 .map_err(|err| EgressError::Ndi(err.to_string()))?;
             self.sender.send_audio(&frame);
             Ok(())
         }
+    }
+
+    fn ndi_i32(value: u32) -> Result<i32, EgressError> {
+        i32::try_from(value).map_err(|_| EgressError::InvalidFrame("value does not fit an NDI frame"))
     }
 }
 

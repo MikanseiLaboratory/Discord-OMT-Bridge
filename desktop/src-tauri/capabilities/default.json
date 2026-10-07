@@ -12,7 +12,18 @@
     "allow-leave-voice",
     "allow-assign-slot",
     "allow-clear-slot",
+    "allow-add-output",
+    "allow-remove-output",
+    "allow-rename-output",
+    "allow-set-output-route",
+    "allow-set-output-transport",
+    "allow-recent-logs",
     "allow-set-voice-flags",
+    "allow-discord-login",
+    "allow-discord-mfa",
+    "allow-discord-sms",
+    "allow-open-discord-login",
+    "allow-previews",
     "allow-snapshot"
   ]
 }

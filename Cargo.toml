@@ -35,3 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 bytes = "1"
 grafton-ndi = "0.13"
+
+[patch.crates-io]
+# rav1d 1.1.0 aborts the process when a bad AV1 frame hits its error path.
+rav1d = { path = "third_party/rav1d" }

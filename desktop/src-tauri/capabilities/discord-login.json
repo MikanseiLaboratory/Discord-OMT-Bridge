@@ -1,0 +1,15 @@
+{
+  "identifier": "discord-login",
+  "description": "The official Discord login page may report the session it just created.",
+  "windows": ["discord-login"],
+  "remote": {
+    "urls": [
+      "https://discord.com/*",
+      "https://*.discord.com/*",
+      "https://discordapp.com/*",
+      "https://*.discordapp.com/*"
+    ]
+  },
+  "local": false,
+  "permissions": ["allow-complete-discord-login"]
+}

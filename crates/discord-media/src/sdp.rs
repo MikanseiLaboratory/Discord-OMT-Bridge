@@ -42,13 +42,11 @@ pub struct CodecAdvertisement {
     pub decode: bool,
 }
 
-/// Opus plus H.264 decode. Other codecs are advertised only when the offer has them,
-/// and only H.264 is marked decodable so AV1/H.265 frames are not requested.
+/// Opus, AV1, and H.264. AV1 is what the official client sends for camera and
+/// Go Live, so it has to be marked decodable or the SFU forwards padding only.
 pub fn advertisements_from_offer(local_sdp: &str) -> Vec<CodecAdvertisement> {
-    let opus = payload_of(local_sdp, "opus").unwrap_or(111);
-    let h264 = payload_of(local_sdp, "H264").unwrap_or(102);
-    let h264_rtx = rtx_for(local_sdp, h264);
-    let mut codecs = vec![
+    let opus = payload_of(local_sdp, "opus").filter(|payload| *payload == 120).unwrap_or(120);
+    vec![
         CodecAdvertisement {
             name: "opus",
             kind: "audio",
@@ -59,35 +57,24 @@ pub fn advertisements_from_offer(local_sdp: &str) -> Vec<CodecAdvertisement> {
             decode: true,
         },
         CodecAdvertisement {
-            name: "H264",
+            name: "AV1",
             kind: "video",
             priority: 1000,
-            payload_type: h264,
-            rtx_payload_type: h264_rtx,
+            payload_type: 101,
+            rtx_payload_type: Some(102),
             encode: false,
             decode: true,
         },
-    ];
-    for (name, priority) in [("H265", 2000u32), ("AV1", 3000), ("VP8", 4000), ("VP9", 5000)] {
-        if let Some(payload) = payload_of(local_sdp, name) {
-            codecs.push(CodecAdvertisement {
-                name: match name {
-                    "H265" => "H265",
-                    "AV1" => "AV1",
-                    "VP8" => "VP8",
-                    "VP9" => "VP9",
-                    _ => "H264",
-                },
-                kind: "video",
-                priority,
-                payload_type: payload,
-                rtx_payload_type: rtx_for(local_sdp, payload),
-                encode: false,
-                decode: false,
-            });
-        }
-    }
-    codecs
+        CodecAdvertisement {
+            name: "H264",
+            kind: "video",
+            priority: 2000,
+            payload_type: 103,
+            rtx_payload_type: Some(104),
+            encode: false,
+            decode: true,
+        },
+    ]
 }
 
 pub fn payload_of(sdp: &str, codec: &str) -> Option<u8> {
@@ -100,17 +87,6 @@ pub fn payload_of(sdp: &str, codec: &str) -> Option<u8> {
     })
 }
 
-fn rtx_for(sdp: &str, apt: u8) -> Option<u8> {
-    let needle = format!("apt={apt}");
-    sdp.lines().find_map(|line| {
-        let rest = line.trim().strip_prefix("a=fmtp:")?;
-        if !rest.contains(&needle) {
-            return None;
-        }
-        rest.split_whitespace().next()?.parse().ok()
-    })
-}
-
 #[derive(Debug, Clone)]
 pub struct TransportParams {
     pub ice_ufrag: String,
@@ -118,6 +94,7 @@ pub struct TransportParams {
     pub fingerprint: String,
     pub candidates: Vec<String>,
     pub connection: String,
+    pub media_port: u16,
 }
 
 pub fn transport_from_server_sdp(sdp: &str) -> Option<TransportParams> {
@@ -126,6 +103,7 @@ pub fn transport_from_server_sdp(sdp: &str) -> Option<TransportParams> {
     let mut fingerprint = None;
     let mut candidates = Vec::new();
     let mut connection = None;
+    let mut media_port = 0u16;
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("a=ice-ufrag:") {
@@ -134,10 +112,22 @@ pub fn transport_from_server_sdp(sdp: &str) -> Option<TransportParams> {
             ice_pwd = Some(value.to_owned());
         } else if let Some(value) = line.strip_prefix("a=fingerprint:") {
             fingerprint = Some(value.to_owned());
-        } else if line.starts_with("a=candidate:") {
-            candidates.push(line.trim_start_matches("a=").to_owned());
+        } else if let Some(value) = line.strip_prefix("a=candidate:") {
+            candidates.push(normalize_candidate(value));
         } else if line.starts_with("c=") && connection.is_none() {
             connection = Some(line.to_owned());
+        } else if media_port == 0 {
+            if let Some(rest) = line.strip_prefix("m=") {
+                media_port = rest.split_whitespace().nth(1).and_then(|port| port.parse().ok()).unwrap_or(0);
+            }
+        }
+    }
+    let connection = connection.unwrap_or_else(|| "c=IN IP4 0.0.0.0".into());
+    if candidates.is_empty() {
+        if let Some(address) = connection.strip_prefix("c=IN IP4 ").map(str::trim) {
+            if !address.is_empty() && address != "0.0.0.0" && media_port > 9 {
+                candidates.push(format!("candidate:1 1 udp 2130706431 {address} {media_port} typ host"));
+            }
         }
     }
     Some(TransportParams {
@@ -145,8 +135,17 @@ pub fn transport_from_server_sdp(sdp: &str) -> Option<TransportParams> {
         ice_pwd: ice_pwd?,
         fingerprint: fingerprint?,
         candidates,
-        connection: connection.unwrap_or_else(|| "c=IN IP4 0.0.0.0".into()),
+        connection,
+        media_port,
     })
+}
+
+fn normalize_candidate(value: &str) -> String {
+    let mut parts: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+    if parts.len() >= 3 {
+        parts[2] = parts[2].to_ascii_lowercase();
+    }
+    format!("candidate:{}", parts.join(" "))
 }
 
 #[derive(Debug, Clone)]
@@ -157,8 +156,20 @@ struct OfferedSection {
     payloads: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignedSsrc {
+    pub user_id: u64,
+    pub ssrc: u32,
+    pub rtx: u32,
+}
+
 /// Build an answer with the same m-line count as the local offer.
-pub fn synthesize_answer(local_offer: &str, server_sdp: &str, remote_video_ssrcs: &[u32]) -> Option<String> {
+pub fn synthesize_answer(
+    local_offer: &str,
+    server_sdp: &str,
+    audio: &[AssignedSsrc],
+    video: &[AssignedSsrc],
+) -> Option<String> {
     let transport = transport_from_server_sdp(server_sdp)?;
     let sections = offered_sections(local_offer);
     if sections.is_empty() {
@@ -176,9 +187,7 @@ pub fn synthesize_answer(local_offer: &str, server_sdp: &str, remote_video_ssrcs
     out.push_str(&format!("a=ice-pwd:{}\r\n", transport.ice_pwd));
     out.push_str(&format!("a=fingerprint:{}\r\n", transport.fingerprint));
     out.push_str("a=ice-lite\r\n");
-    for candidate in &transport.candidates {
-        out.push_str(&format!("a={candidate}\r\n"));
-    }
+    let mut audio_index = 0usize;
     let mut video_index = 0usize;
     for section in &sections {
         let payloads = if section.payloads.is_empty() {
@@ -186,13 +195,28 @@ pub fn synthesize_answer(local_offer: &str, server_sdp: &str, remote_video_ssrcs
         } else {
             section.payloads.join(" ")
         };
-        out.push_str(&format!("m={} 9 UDP/TLS/RTP/SAVPF {payloads}\r\n", section.kind));
+        let port = if transport.media_port > 9 { transport.media_port } else { 9 };
+        out.push_str(&format!("m={} {port} UDP/TLS/RTP/SAVPF {payloads}\r\n", section.kind));
         out.push_str(&format!("{}\r\n", transport.connection));
         out.push_str("a=rtcp:9 IN IP4 0.0.0.0\r\n");
         out.push_str("a=setup:passive\r\n");
         out.push_str(&format!("a=mid:{}\r\n", section.mid));
+        for candidate in &transport.candidates {
+            out.push_str(&format!("a={candidate}\r\n"));
+        }
         out.push_str("a=rtcp-mux\r\n");
-        let direction = answer_direction(&section.direction, section.kind == "video" && video_index < remote_video_ssrcs.len());
+        let assigned = if section.kind == "audio" {
+            let stream = audio.get(audio_index).copied();
+            audio_index += 1;
+            stream
+        } else if section.kind == "video" {
+            let stream = video.get(video_index).copied();
+            video_index += 1;
+            stream
+        } else {
+            None
+        };
+        let direction = answer_direction(&section.direction, assigned.is_some());
         out.push_str(&format!("a={direction}\r\n"));
         for line in local_offer.lines() {
             let line = line.trim();
@@ -216,11 +240,17 @@ pub fn synthesize_answer(local_offer: &str, server_sdp: &str, remote_video_ssrcs
                 out.push_str("a=maxptime:60\r\n");
             }
         }
-        if section.kind == "video" {
-            if let Some(ssrc) = remote_video_ssrcs.get(video_index) {
-                out.push_str(&format!("a=ssrc:{ssrc} cname:discord-omt\r\n"));
+        if let Some(stream) = assigned {
+            let sentinel = if section.kind == "video" { "v" } else { "a" };
+            let label = format!("{sentinel}{}-{}", stream.user_id, stream.ssrc);
+            out.push_str(&format!("a=msid:{label} {label}\r\n"));
+            if section.kind == "video" && stream.rtx != 0 {
+                out.push_str(&format!("a=ssrc-group:FID {} {}\r\n", stream.ssrc, stream.rtx));
             }
-            video_index += 1;
+            out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.ssrc));
+            if section.kind == "video" && stream.rtx != 0 {
+                out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.rtx));
+            }
         }
     }
     Some(out)
@@ -315,10 +345,38 @@ a=fingerprint:sha-256 CC:DD\r
 a=candidate:1 1 udp 1 127.0.0.1 50000 typ host\r
 c=IN IP4 127.0.0.1\r
 ";
-        let answer = synthesize_answer(OFFER, server, &[42]).unwrap();
+        let answer = synthesize_answer(
+            OFFER,
+            server,
+            &[],
+            &[AssignedSsrc { user_id: 7, ssrc: 42, rtx: 43 }],
+        )
+        .unwrap();
         assert_eq!(answer.matches("m=").count(), 2);
-        assert!(answer.contains("a=ssrc:42 cname:discord-omt"));
+        assert!(answer.contains("a=ssrc:42 cname:v7-42"));
+        assert!(answer.contains("a=ssrc-group:FID 42 43"));
+        let video = answer.split("m=video").nth(1).unwrap_or("");
+        assert!(video.contains("a=sendonly"));
         assert!(answer.contains("a=setup:passive"));
         assert!(answer.contains("a=ice-ufrag:remote"));
+        let media = answer.split_once("m=").map(|(_, rest)| rest).unwrap_or("");
+        assert!(media.contains("a=candidate:1 1 udp 1 127.0.0.1 50000 typ host"));
+    }
+
+    #[test]
+    fn connection_line_becomes_a_host_candidate() {
+        let server = "\
+m=audio 50010 UDP/TLS/RTP/SAVPF 111\r
+c=IN IP4 203.0.113.8\r
+a=ice-ufrag:remote\r
+a=ice-pwd:remotepwd\r
+a=fingerprint:sha-256 CC:DD\r
+";
+        let transport = transport_from_server_sdp(server).unwrap();
+        assert_eq!(transport.candidates.len(), 1);
+        assert!(transport.candidates[0].contains("203.0.113.8 50010"));
+        let answer = synthesize_answer(OFFER, server, &[], &[]).unwrap();
+        let media = answer.split_once("m=").unwrap().1;
+        assert!(media.contains("a=candidate:1 1 udp 2130706431 203.0.113.8 50010 typ host"));
     }
 }

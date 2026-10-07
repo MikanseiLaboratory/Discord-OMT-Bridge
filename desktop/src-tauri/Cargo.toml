@@ -7,7 +7,7 @@ publish.workspace = true
 description = "Discord OMT Bridge desktop"
 
 [features]
-default = []
+default = ["ndi"]
 ndi = ["discord-omt-bridge/ndi"]
 
 [build-dependencies]

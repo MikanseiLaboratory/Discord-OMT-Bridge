@@ -44,6 +44,66 @@ description = "Clear a persistent LAN slot assignment."
 commands.allow = ["clear_slot"]
 
 [[permission]]
+identifier = "allow-add-output"
+description = "Create a named LAN output."
+commands.allow = ["add_output"]
+
+[[permission]]
+identifier = "allow-remove-output"
+description = "Remove a named LAN output."
+commands.allow = ["remove_output"]
+
+[[permission]]
+identifier = "allow-rename-output"
+description = "Rename a named LAN output."
+commands.allow = ["rename_output"]
+
+[[permission]]
+identifier = "allow-set-output-route"
+description = "Choose the input of a LAN output."
+commands.allow = ["set_output_route"]
+
+[[permission]]
+identifier = "allow-set-output-transport"
+description = "Choose OMT or NDI for an output."
+commands.allow = ["set_output_transport"]
+
+[[permission]]
+identifier = "allow-recent-logs"
+description = "Read collected info and error logs."
+commands.allow = ["recent_logs"]
+
+[[permission]]
+identifier = "allow-discord-login"
+description = "Log in with email, password, and a solved captcha."
+commands.allow = ["discord_login"]
+
+[[permission]]
+identifier = "allow-discord-mfa"
+description = "Submit a two-factor code."
+commands.allow = ["discord_mfa"]
+
+[[permission]]
+identifier = "allow-discord-sms"
+description = "Send a login SMS code."
+commands.allow = ["discord_sms"]
+
+[[permission]]
+identifier = "allow-open-discord-login"
+description = "Open the official Discord login window."
+commands.allow = ["open_discord_login"]
+
+[[permission]]
+identifier = "allow-complete-discord-login"
+description = "Save the token from the official Discord login window."
+commands.allow = ["complete_discord_login"]
+
+[[permission]]
 identifier = "allow-snapshot"
 description = "Read the bridge snapshot."
 commands.allow = ["snapshot"]
+
+[[permission]]
+identifier = "allow-previews"
+description = "Read the latest received video frames."
+commands.allow = ["previews"]

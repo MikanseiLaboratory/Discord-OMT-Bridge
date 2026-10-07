@@ -61,19 +61,16 @@ impl DaveState {
             .map_err(|err| MediaError::Dave(err.to_string()))
     }
 
-    pub fn proposals(
-        &mut self,
-        operation: u8,
-        proposals: &[u8],
-        expected_users: &[u64],
-    ) -> Result<Option<davey::CommitWelcome>, MediaError> {
+    pub fn proposals(&mut self, operation: u8, proposals: &[u8]) -> Result<Option<davey::CommitWelcome>, MediaError> {
         let operation = match operation {
             0 => ProposalsOperationType::APPEND,
             1 => ProposalsOperationType::REVOKE,
             other => return Err(MediaError::Dave(format!("unknown proposal op {other}"))),
         };
+        // Discord adds people to the MLS group before our roster sees them.
+        // Rejecting those proposals aborts the key exchange, so audio and video stay undecrypted.
         self.session
-            .process_proposals(operation, proposals, Some(expected_users))
+            .process_proposals(operation, proposals, None)
             .map_err(|err| MediaError::Dave(err.to_string()))
     }
 

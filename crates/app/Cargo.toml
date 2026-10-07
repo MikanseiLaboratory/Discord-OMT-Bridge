@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["ndi"]
 ndi = ["egress/ndi"]
 
 [dependencies]

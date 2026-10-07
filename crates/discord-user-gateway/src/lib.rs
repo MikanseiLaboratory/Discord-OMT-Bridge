@@ -1,10 +1,12 @@
 mod client;
 mod directory;
+mod login;
 
 pub use client::{
     spawn_gateway, GatewayCommand, GatewayEvent, GatewayHandle, StreamEndpoint, VoiceEndpoint,
     VoiceMember,
 };
+pub use login::{login_password, send_login_sms, submit_mfa, AuthStep, CaptchaAnswer, CaptchaChallenge};
 pub use directory::{ChannelKind, ChannelRecord, GuildRecord};
 
 use thiserror::Error;

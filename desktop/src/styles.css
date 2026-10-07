@@ -18,7 +18,7 @@
 
 * { box-sizing: border-box; }
 
-html, body, #app {
+html, body, #root {
   margin: 0;
   height: 100%;
   background: var(--server);
@@ -27,7 +27,7 @@ html, body, #app {
   font-size: 16px;
 }
 
-button, input, textarea { font: inherit; color: inherit; }
+button, input, textarea, select { font: inherit; color: inherit; }
 
 button { cursor: pointer; }
 
@@ -87,7 +87,7 @@ label.field {
   text-transform: uppercase;
 }
 
-input[type="text"], input[type="password"], input[type="number"], textarea {
+input[type="text"], input[type="password"], input[type="email"], input[type="number"], textarea, select {
   width: 100%;
   margin-top: 8px;
   padding: 10px;
@@ -100,7 +100,7 @@ input[type="text"], input[type="password"], input[type="number"], textarea {
 
 textarea { min-height: 96px; resize: vertical; }
 
-input:focus, textarea:focus { box-shadow: 0 0 0 2px var(--blurple); }
+input:focus, textarea:focus, select:focus { box-shadow: 0 0 0 2px var(--blurple); }
 
 .primary, .secondary, .danger {
   border: none;
@@ -115,7 +115,12 @@ input:focus, textarea:focus { box-shadow: 0 0 0 2px var(--blurple); }
 button:disabled { opacity: 0.45; cursor: default; }
 .danger { background: var(--red); color: white; }
 
-.gate-card .primary { width: 100%; margin-top: 16px; }
+.gate-card .primary, .gate-card .secondary { width: 100%; margin-top: 16px; }
+.gate-card .actions { display: flex; gap: 8px; }
+.gate-card .actions .secondary { margin-top: 8px; }
+.gate-card details { margin-top: 16px; color: var(--muted); }
+.gate-card summary { cursor: pointer; }
+#captcha-box { margin-top: 16px; min-height: 78px; }
 
 .warning {
   margin-top: 16px;
@@ -389,6 +394,29 @@ button:disabled { opacity: 0.45; cursor: default; }
   gap: 8px;
 }
 
+.previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.preview-card {
+  background: var(--server);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.preview-card canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #000;
+}
+.preview-caption {
+  padding: 8px 10px;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
 .tile {
   position: relative;
   min-height: 180px;
@@ -439,7 +467,6 @@ button:disabled { opacity: 0.45; cursor: default; }
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
-  text-transform: uppercase;
 }
 .source-card .sname {
   color: var(--text-strong);
@@ -451,6 +478,12 @@ button:disabled { opacity: 0.45; cursor: default; }
 .slot-actions { display: flex; gap: 6px; margin-top: 8px; }
 .slot-actions button { flex: 1; }
 .source-scroll .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 8px; }
+.matrix { max-width: 420px; }
+.matrix input, .matrix select { user-select: text; margin-top: 0; }
+.matrix-add, .source-card { display: flex; flex-direction: column; gap: 6px; }
+.matrix-add { margin-bottom: 12px; }
+.matrix-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+.matrix .primary, .matrix .secondary { width: 100%; }
 
 .settings {
   height: 100%;
@@ -537,3 +570,31 @@ button:disabled { opacity: 0.45; cursor: default; }
 .unsaved.show { display: flex; }
 
 .slider { width: 100%; margin-top: 8px; accent-color: var(--blurple); }
+
+.log-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--main);
+}
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  background: var(--panel);
+}
+.log-toolbar h1 { margin: 0; font-size: 20px; color: var(--text-strong); }
+.log-toolbar .secondary { width: auto; }
+.log-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 12px 20px 24px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.log-line { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.log-line.error { color: var(--red); }
+.log-line.warn { color: #fee75c; }

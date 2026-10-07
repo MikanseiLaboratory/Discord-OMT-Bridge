@@ -52,25 +52,34 @@ pub struct GuildRecord {
 }
 
 pub fn read_guild(data: &Value) -> Option<GuildRecord> {
+    if data.get("unavailable").and_then(|value| value.as_bool()) == Some(true) {
+        return None;
+    }
     let id = parse_id(data.get("id"))?;
-    let name = data
-        .get("name")
-        .and_then(|value| value.as_str())
+    let properties = data.get("properties");
+    let name = text_field(data, properties, "name")
+        .filter(|name| !name.is_empty())
         .unwrap_or("サーバー")
         .to_owned();
-    let icon = data
-        .get("icon")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned);
-    let channels = data.get("channels").and_then(|value| value.as_array()).map(|channels| {
-        channels.iter().filter_map(read_channel).collect()
-    });
+    let icon = text_field(data, properties, "icon").map(str::to_owned);
+    let channels = data
+        .get("channels")
+        .or_else(|| data.pointer("/partial_updates/channels"))
+        .and_then(|value| value.as_array())
+        .map(|channels| channels.iter().filter_map(read_channel).collect());
     Some(GuildRecord {
         id,
         name,
         icon,
         channels,
     })
+}
+
+fn text_field<'a>(data: &'a Value, properties: Option<&'a Value>, key: &str) -> Option<&'a str> {
+    properties
+        .and_then(|item| item.get(key))
+        .or_else(|| data.get(key))
+        .and_then(|value| value.as_str())
 }
 
 pub fn read_channel(data: &Value) -> Option<ChannelRecord> {
@@ -120,5 +129,18 @@ mod tests {
         let update = read_guild(&renamed).unwrap();
         assert!(update.channels.is_none());
         assert_eq!(update.name, "Studio 2");
+
+        let wrapped = json!({
+            "id": "100",
+            "properties": {"name": "Wrapped", "icon": "hash"},
+            "channels": [{"id": "2", "name": "booth", "type": 2, "position": 1}]
+        });
+        let modern = read_guild(&wrapped).unwrap();
+        assert_eq!(modern.name, "Wrapped");
+        assert_eq!(modern.icon.as_deref(), Some("hash"));
+        assert_eq!(modern.channels.unwrap().len(), 1);
+
+        let offline = json!({"id": "100", "unavailable": true});
+        assert!(read_guild(&offline).is_none());
     }
 }

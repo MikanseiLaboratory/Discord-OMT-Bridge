@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
 
 use crate::config::{Config, RuntimeSettings};
-use crate::router::{log_sources, SourceKind, SourceRouter};
-use crate::snapshot::{capture, ChannelState, GuildState, MemberState, SeatInput, Snapshot, UserState};
+use crate::router::{log_sources, SourceKind, SourceRouter, Transport};
+use crate::snapshot::{capture, ChannelState, GuildState, MemberState, PreviewFrame, SeatInput, Snapshot, UserState};
 
 enum Bus {
     Gateway(GatewayEvent),
@@ -26,13 +26,38 @@ pub enum ControlCommand {
         slot_id: String,
         channel_id: u64,
         user_id: u64,
+        kind: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Clear {
         slot_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    AddOutput {
+        id: String,
+        name: String,
+        kind: String,
+        transport: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SetTransport {
+        id: String,
+        transport: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RemoveOutput {
+        id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RenameOutput {
+        id: String,
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Apply(RuntimeSettings),
+    Previews {
+        reply: oneshot::Sender<Vec<PreviewFrame>>,
+    },
     Shutdown,
 }
 
@@ -55,12 +80,13 @@ impl BridgeHandle {
         self.send(ControlCommand::Leave { guild_id, channel_id })
     }
 
-    pub fn assign_slot(&self, slot_id: String, channel_id: u64, user_id: u64) -> Result<(), String> {
+    pub fn assign_slot(&self, slot_id: String, channel_id: u64, user_id: u64, kind: String) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
         self.send(ControlCommand::Assign {
             slot_id,
             channel_id,
             user_id,
+            kind,
             reply,
         })?;
         waiter
@@ -74,6 +100,52 @@ impl BridgeHandle {
         waiter
             .blocking_recv()
             .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn add_output(&self, id: String, name: String, kind: String, transport: String) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::AddOutput {
+            id,
+            name,
+            kind,
+            transport,
+            reply,
+        })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn remove_output(&self, id: String) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::RemoveOutput { id, reply })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn set_transport(&self, id: String, transport: String) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::SetTransport { id, transport, reply })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn rename_output(&self, id: String, name: String) -> Result<(), String> {
+        let (reply, waiter) = oneshot::channel();
+        self.send(ControlCommand::RenameOutput { id, name, reply })?;
+        waiter
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+    }
+
+    pub fn previews(&self) -> Vec<PreviewFrame> {
+        let (reply, waiter) = oneshot::channel();
+        if self.send(ControlCommand::Previews { reply }).is_err() {
+            return Vec::new();
+        }
+        waiter.blocking_recv().unwrap_or_default()
     }
 
     pub fn apply(&self, runtime: RuntimeSettings) -> Result<(), String> {
@@ -183,6 +255,8 @@ struct MediaState {
     mute_pending: bool,
     /// Last channel sent with the gateway voice state.
     announced: Option<(u64, u64)>,
+    autojoined: bool,
+    watched: HashSet<String>,
 }
 
 async fn run_session(mut session: Session) -> anyhow::Result<()> {
@@ -216,6 +290,8 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
         discard_until: None,
         mute_pending: false,
         announced: None,
+        autojoined: false,
+        watched: HashSet::new(),
     };
     for (guild_id, channel_id) in session.initial_joins.drain(..) {
         ensure_seat(&mut media, guild_id, channel_id);
@@ -288,8 +364,13 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         }
                         pump_joins(&world, &mut media, &commands, &session.config).await?;
                     }
-                    Some(ControlCommand::Assign { slot_id, channel_id, user_id, reply }) => {
-                        let result = router.assign(&slot_id, channel_id, user_id);
+                    Some(ControlCommand::Assign { slot_id, channel_id, user_id, kind, reply }) => {
+                        let parsed = if kind.trim().is_empty() {
+                            Ok(None)
+                        } else {
+                            SourceKind::parse(&kind).map(Some)
+                        };
+                        let result = parsed.and_then(|kind| router.assign(&slot_id, channel_id, user_id, kind));
                         if let Err(err) = &result {
                             world.last_error = Some(err.clone());
                         }
@@ -302,16 +383,44 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         }
                         let _ = reply.send(result);
                     }
+                    Some(ControlCommand::AddOutput { id, name, kind, transport, reply }) => {
+                        let result = SourceKind::parse(&kind).and_then(|parsed| {
+                            Transport::parse(&transport)
+                                .and_then(|transport| router.add_output(id, name, parsed, transport, 0, 0))
+                        });
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(ControlCommand::RemoveOutput { id, reply }) => {
+                        let result = router.remove_output(&id);
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(ControlCommand::SetTransport { id, transport, reply }) => {
+                        let result = Transport::parse(&transport).and_then(|transport| router.set_transport(&id, transport));
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(ControlCommand::RenameOutput { id, name, reply }) => {
+                        let result = router.rename(&id, name);
+                        if let Err(err) = &result {
+                            world.last_error = Some(err.clone());
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(ControlCommand::Previews { reply }) => {
+                        let _ = reply.send(router.preview_frames());
+                    }
                     Some(ControlCommand::Apply(runtime)) => {
                         let mute_changed = runtime.self_mute != session.config.self_mute
                             || runtime.self_deaf != session.config.self_deaf;
-                        let outputs_changed = runtime.enable_omt != session.config.enable_omt
-                            || runtime.enable_ndi != session.config.enable_ndi
-                            || runtime.source_prefix != session.config.source_prefix;
                         session.config.apply_runtime(&runtime);
-                        if outputs_changed {
-                            tracing::info!("OMT、NDI、接頭辞、スロット数は次の接続から使います");
-                        }
                         if mute_changed {
                             media.mute_pending = true;
                             pump_joins(&world, &mut media, &commands, &session.config).await?;
@@ -335,20 +444,35 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         ).await?;
                     }
                     Bus::Voice { channel_id, event } => {
+                        let mut retry_guild = None;
                         if let MediaEvent::Disconnected { reason } = &event {
                             world.last_error = Some(reason.clone());
                             if let Some(seat) = media.seats.iter_mut().find(|seat| seat.channel_id == channel_id) {
                                 seat.connected = false;
+                                if let Some(handle) = seat.voice.take() {
+                                    handle.cancel.cancel();
+                                }
+                                retry_guild = Some(seat.guild_id);
                             }
+                        }
+                        if let Some(guild_id) = retry_guild {
+                            tracing::info!(channel_id, "voice media dropped; rejoining");
+                            enqueue(&mut media, guild_id, channel_id);
+                            media.discard_until = Some(Instant::now() + Duration::from_secs(2));
                         }
                         apply_media(&session.config, &mut router, self_id, channel_id, MediaKind::Voice, &event);
                     }
                     Bus::Stream { key, event } => {
+                        let mut rewatch = false;
                         if let MediaEvent::Disconnected { reason } = &event {
                             world.last_error = Some(reason.clone());
-                            if let Some(handle) = media.streams.remove(&key) {
-                                handle.cancel.cancel();
-                            }
+                            rewatch = media.streams.remove(&key).is_some();
+                        }
+                        if rewatch {
+                            tracing::info!(%key, "Go Live media dropped; watching again");
+                            commands
+                                .send(GatewayCommand::WatchStream { stream_key: key.clone() })
+                                .await?;
                         }
                         let channel_id = discord_user_gateway::parse_stream_key(&key)
                             .map(|(_, channel_id, _)| channel_id)
@@ -360,6 +484,35 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn consider_autojoin(world: &World, media: &mut MediaState) {
+    if media.autojoined || !world.ready {
+        return;
+    }
+    let Ok(spec) = std::env::var("DISCORD_OMT_AUTOJOIN") else {
+        return;
+    };
+    let Some((guild_part, channel_part)) = spec.split_once('|') else {
+        return;
+    };
+    let guild_part = guild_part.trim();
+    let channel_part = channel_part.trim();
+    if guild_part.is_empty() || channel_part.is_empty() {
+        return;
+    }
+    let Some(guild) = world.guilds.iter().find(|guild| guild.name.contains(guild_part)) else {
+        return;
+    };
+    let Some(channel) = guild.channels.iter().find(|channel| {
+        channel.kind == "voice" && channel.name.eq_ignore_ascii_case(channel_part)
+    }) else {
+        return;
+    };
+    media.autojoined = true;
+    tracing::info!(guild = %guild.name, channel = %channel.name, "joining test channel");
+    ensure_seat(media, guild.id, channel.id);
+    enqueue(media, guild.id, channel.id);
 }
 
 fn ensure_seat(media: &mut MediaState, guild_id: u64, channel_id: u64) {
@@ -525,6 +678,43 @@ async fn shutdown(commands: &mpsc::Sender<GatewayCommand>, media: &mut MediaStat
     }
 }
 
+async fn watch_live(
+    commands: &mpsc::Sender<GatewayCommand>,
+    world: &World,
+    media: &mut MediaState,
+    config: &Config,
+    self_id: u64,
+) -> anyhow::Result<()> {
+    let connected: Vec<(u64, u64)> = media
+        .seats
+        .iter()
+        .filter(|seat| seat.connected && !seat.session_id.is_empty())
+        .map(|seat| (seat.guild_id, seat.channel_id))
+        .collect();
+    for member in world.members.values() {
+        if !member.live || member.user_id == self_id || !config.allows(member.user_id) {
+            continue;
+        }
+        let (Some(guild_id), Some(channel_id)) = (member.guild_id, member.channel_id) else {
+            continue;
+        };
+        if !connected.contains(&(guild_id, channel_id)) {
+            continue;
+        }
+        let stream_key = format!("guild:{guild_id}:{channel_id}:{}", member.user_id);
+        if media.watched.insert(stream_key.clone()) {
+            tracing::info!("watching Go Live");
+            commands.send(GatewayCommand::WatchStream { stream_key }).await?;
+        }
+    }
+    Ok(())
+}
+
+fn placeholder_name(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || name == "取得中" || name.starts_with("user-")
+}
+
 async fn handle_gateway(
     event: GatewayEvent,
     config: &Config,
@@ -547,6 +737,7 @@ async fn handle_gateway(
                 avatar,
             });
             tracing::info!(user_id, %username, "gateway ready");
+            consider_autojoin(world, media);
             let pending: Vec<(u64, u64)> = media
                 .seats
                 .iter()
@@ -558,26 +749,50 @@ async fn handle_gateway(
             }
             pump_joins(world, media, commands, config).await?;
         }
-        GatewayEvent::GuildUpsert(guild) => upsert_guild(&mut world.guilds, guild),
+        GatewayEvent::GuildUpsert(guild) => {
+            upsert_guild(&mut world.guilds, guild);
+            consider_autojoin(world, media);
+            pump_joins(world, media, commands, config).await?;
+        }
         GatewayEvent::GuildRemoved { guild_id } => {
             world.guilds.retain(|guild| guild.id != guild_id);
             world.members.retain(|_, member| member.guild_id != Some(guild_id));
         }
-        GatewayEvent::ChannelUpsert { guild_id, channel } => upsert_channel(&mut world.guilds, guild_id, channel),
+        GatewayEvent::ChannelUpsert { guild_id, channel } => {
+            upsert_channel(&mut world.guilds, guild_id, channel);
+            consider_autojoin(world, media);
+            pump_joins(world, media, commands, config).await?;
+        }
         GatewayEvent::ChannelRemoved { guild_id, channel_id } => {
             if let Some(guild) = world.guilds.iter_mut().find(|guild| guild.id == guild_id) {
                 guild.channels.retain(|channel| channel.id != channel_id);
             }
         }
-        GatewayEvent::VoiceMember(member) => {
-            let name = if member.display_name.is_empty() {
-                if member.user_id == *self_id {
-                    world.self_user.as_ref().map(|user| user.name.clone()).unwrap_or_default()
-                } else {
-                    format!("user-{}", member.user_id)
+        GatewayEvent::Profile { user_id, name, avatar } => {
+            if let Some(member) = world.members.get_mut(&user_id) {
+                if placeholder_name(&member.name) {
+                    member.name = name.clone();
                 }
-            } else {
+                if member.avatar.is_none() {
+                    member.avatar = avatar;
+                }
+            }
+            router.set_name(user_id, name);
+        }
+        GatewayEvent::VoiceMember(member) => {
+            let name = if !member.display_name.is_empty() {
                 member.display_name.clone()
+            } else if let Some(existing) = world.members.get(&member.user_id).filter(|existing| !placeholder_name(&existing.name)) {
+                existing.name.clone()
+            } else if member.user_id == *self_id {
+                world
+                    .self_user
+                    .as_ref()
+                    .map(|user| user.name.clone())
+                    .filter(|name| !placeholder_name(name))
+                    .unwrap_or_else(|| "取得中".into())
+            } else {
+                "取得中".into()
             };
             if member.channel_id.is_none() {
                 world.members.remove(&member.user_id);
@@ -597,12 +812,19 @@ async fn handle_gateway(
                     },
                 );
             }
-            if !name.is_empty() {
+            if !placeholder_name(&name) {
                 router.set_name(member.user_id, name);
             }
+            if let (Some(guild_id), Some(channel_id)) = (member.guild_id, member.channel_id) {
+                if !member.self_stream {
+                    media.watched.remove(&format!("guild:{guild_id}:{channel_id}:{}", member.user_id));
+                }
+            }
+            watch_live(commands, world, media, config, *self_id).await?;
         }
         GatewayEvent::VoiceReady(endpoint) => {
             attach_voice(config, *self_id, endpoint, bus_tx, media)?;
+            watch_live(commands, world, media, config, *self_id).await?;
             pump_joins(world, media, commands, config).await?;
         }
         GatewayEvent::StreamAnnounced { stream_key, user_id, paused } => {

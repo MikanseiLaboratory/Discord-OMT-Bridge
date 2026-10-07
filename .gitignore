@@ -1,4 +1,5 @@
 /target
+/target-av1
 **/*.rs.bk
 .env
 config.toml
@@ -6,4 +7,5 @@ config.toml
 *.user
 .DS_Store
 desktop/node_modules
+desktop/dist
 desktop/src-tauri/gen
