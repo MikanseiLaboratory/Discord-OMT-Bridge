@@ -94,9 +94,10 @@ impl Av1Decoder {
             settings.assume_init()
         };
         // One worker thread hits a rav1d bug: a bad frame unwraps a missing
-        // frame header and aborts the process. Two threads take the path that
-        // returns the error instead.
-        settings.n_threads = 2;
+        // frame header and aborts the process. Extra threads take the path
+        // that returns the error, and they keep 1080p closer to realtime.
+        let threads = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
+        settings.n_threads = i32::try_from(threads.clamp(4, 8)).unwrap_or(4);
         settings.max_frame_delay = 1;
         let mut ctx = None;
         let status = unsafe { dav1d_open(NonNull::new(&mut ctx), NonNull::new(&mut settings)) };

@@ -59,7 +59,7 @@ pub fn advertisements_from_offer(local_sdp: &str) -> Vec<CodecAdvertisement> {
         CodecAdvertisement {
             name: "AV1",
             kind: "video",
-            priority: 1000,
+            priority: 3000,
             payload_type: 101,
             rtx_payload_type: Some(102),
             encode: false,
@@ -68,7 +68,7 @@ pub fn advertisements_from_offer(local_sdp: &str) -> Vec<CodecAdvertisement> {
         CodecAdvertisement {
             name: "H264",
             kind: "video",
-            priority: 2000,
+            priority: 1000,
             payload_type: 103,
             rtx_payload_type: Some(104),
             encode: false,

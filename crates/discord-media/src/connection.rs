@@ -129,7 +129,9 @@ async fn run_connection(
         .await
         .map_err(|err| MediaError::Voice(err.to_string()))?;
 
-    let (rtp_tx, mut rtp_rx) = mpsc::channel::<(RTPCodecType, webrtc::rtp::packet::Packet)>(256);
+    let (rtp_tx, mut rtp_rx) = mpsc::channel::<(RTPCodecType, webrtc::rtp::packet::Packet)>(2048);
+    let video_jobs = spawn_video_decoder(events.clone());
+    let mut wait_for_keyframe = false;
     let peer = prepare_peer(params.max_video_slots, rtp_tx).await?;
     let (failed_tx, mut failed_rx) = mpsc::channel::<()>(1);
     peer.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
@@ -156,7 +158,6 @@ async fn run_connection(
     let mut heartbeats_started = false;
     let mut opus = OpusDecoder::new()?;
     let mut h264 = H264Decoder::new()?;
-    let mut av1 = Av1Decoder::new()?;
     let mut audio_jitter: HashMap<u32, JitterBuffer<RtpPacket>> = HashMap::new();
     let mut video_jitter: HashMap<u32, JitterBuffer<RtpPacket>> = HashMap::new();
     let mut assemblers: HashMap<u32, H264Packet> = HashMap::new();
@@ -175,6 +176,8 @@ async fn run_connection(
     let mut answer_deadline: Option<Instant> = None;
     let mut local_audio_ssrc = 0u32;
     let mut video_announce: Option<String> = None;
+    let mut video_rtp = 0u32;
+    let mut video_wait: Option<Instant> = None;
     let mut answer_tick = interval(Duration::from_millis(200));
     answer_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -209,6 +212,16 @@ async fn run_connection(
                             tracing::info!(streams = video_streams.len(), "requested video keyframe");
                         }
                     }
+                    if params.kind == MediaKind::GoLive
+                        && video_rtp == 0
+                        && video_streams.iter().any(|stream| stream.ssrc != 0)
+                    {
+                        if video_wait.is_none() {
+                            video_wait = Some(Instant::now());
+                        } else if video_wait.is_some_and(|start| start.elapsed() > Duration::from_secs(4)) {
+                            return Err(MediaError::Voice("Go Live video RTP did not arrive".into()));
+                        }
+                    }
                 }
             }
             _ = heartbeat.tick(), if heartbeats_started => {
@@ -229,7 +242,7 @@ async fn run_connection(
                                     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
                                 }
                                 heartbeats_started = true;
-                                let mut identify = json!({
+                                let identify = json!({
                                     "op": 0,
                                     "d": {
                                         "server_id": params.server_id.to_string(),
@@ -237,21 +250,15 @@ async fn run_connection(
                                         "session_id": params.session_id,
                                         "token": params.token,
                                         "video": true,
+                                        "streams": [{ "type": "video", "rid": "100", "quality": 100 }],
                                         "max_dave_protocol_version": DAVE_VERSION
                                     }
                                 });
-                                if params.kind != MediaKind::GoLive {
-                                    identify["d"]["streams"] = json!([{ "type": "video", "rid": "100", "quality": 100 }]);
-                                }
                                 socket.send(Message::Text(identify.to_string().into())).await?;
                             }
                             2 => {
                                 local_audio_ssrc = payload.pointer("/d/ssrc").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
-                                let ready_streams = if params.kind == MediaKind::GoLive {
-                                    json!([])
-                                } else {
-                                    payload.pointer("/d/streams").cloned().unwrap_or(json!([]))
-                                };
+                                let ready_streams = payload.pointer("/d/streams").cloned().unwrap_or(json!([]));
                                 let (fragment, codecs, sdp, h264_pt, rtx) = offer_bundle(&peer).await?;
                                 local_sdp = sdp;
                                 h264_payload = h264_pt;
@@ -266,7 +273,7 @@ async fn run_connection(
                                     }
                                 });
                                 socket.send(Message::Text(select.to_string().into())).await?;
-                                if local_audio_ssrc != 0 && params.kind != MediaKind::GoLive {
+                                if local_audio_ssrc != 0 {
                                     let announce = inactive_video(local_audio_ssrc, &ready_streams);
                                     video_announce = Some(announce.to_string());
                                     socket.send(Message::Text(announce.to_string().into())).await?;
@@ -419,6 +426,10 @@ async fn run_connection(
                     marker: header.marker,
                     payload_type: header.payload_type,
                 };
+                if kind == RTPCodecType::Video {
+                    video_rtp = video_rtp.saturating_add(1);
+                    video_wait = None;
+                }
                 if rtx_payloads.contains(&item.payload_type) || book.rtx.contains(&header.ssrc) {
                     continue;
                 }
@@ -436,12 +447,13 @@ async fn run_connection(
                         &mut dave,
                         &mut opus,
                         &mut h264,
-                        &mut av1,
                         &mut assemblers,
                         &mut access_units,
                         &mut av1_frames,
                         h264_payload,
                         &events,
+                        &video_jobs,
+                        &mut wait_for_keyframe,
                     ).await;
                 }
             }
@@ -458,12 +470,13 @@ async fn dispatch_rtp(
     dave: &mut DaveState,
     opus: &mut OpusDecoder,
     h264: &mut H264Decoder,
-    av1: &mut Av1Decoder,
     assemblers: &mut HashMap<u32, H264Packet>,
     access_units: &mut HashMap<u32, Vec<u8>>,
     av1_frames: &mut HashMap<u32, Av1Assembler>,
     _h264_payload: u8,
     events: &mpsc::Sender<MediaEvent>,
+    video_jobs: &mpsc::Sender<VideoJob>,
+    wait_for_keyframe: &mut bool,
 ) {
     let Some(user_id) = (if kind == RTPCodecType::Audio {
         book.audio.get(&ssrc).copied()
@@ -513,34 +526,11 @@ async fn dispatch_rtp(
             Ok(plain) => plain,
             Err(err) => {
                 note_reject("video decrypt", format!("{err} bytes={}", access_unit.len()));
+                *wait_for_keyframe = true;
                 return;
             }
         };
-        match av1.decode(&plain) {
-            Ok(Some((bgra, width, height))) => {
-                if frame_has_picture(&bgra) {
-                    note_decoded("video picture");
-                } else {
-                    note_decoded("video black");
-                }
-                let _ = events
-                    .send(MediaEvent::Video {
-                        user_id,
-                        bgra,
-                        width,
-                        height,
-                    })
-                    .await;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let head = plain.get(..4).map(|bytes| format!("{bytes:02x?}")).unwrap_or_default();
-                note_reject("av1 decode", format!("{err} head={head}"));
-                if let Ok(fresh) = Av1Decoder::new() {
-                    *av1 = fresh;
-                }
-            }
-        }
+        queue_video(video_jobs, wait_for_keyframe, user_id, plain);
         return;
     }
     let piece = if matches!(packet.payload_type, 103 | 105 | 125) {
@@ -570,11 +560,7 @@ async fn dispatch_rtp(
             return;
         }
     };
-    let decoded = if packet.payload_type == 101 {
-        av1.decode(&plain)
-    } else {
-        h264.decode(&plain)
-    };
+    let decoded = h264.decode(&plain);
     match decoded {
         Ok(Some((bgra, width, height))) => {
             if frame_has_picture(&bgra) {
@@ -610,6 +596,75 @@ fn note_reject(kind: &str, err: impl std::fmt::Display) {
     if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
         tracing::warn!(kind, error = %err, "media frame rejected");
     }
+}
+
+struct VideoJob {
+    user_id: u64,
+    plain: Vec<u8>,
+    reset: bool,
+}
+
+fn av1_sequence_header(frame: &[u8]) -> bool {
+    frame.first().is_some_and(|byte| (byte >> 3) & 0x0f == 1)
+}
+
+fn queue_video(jobs: &mpsc::Sender<VideoJob>, wait_for_keyframe: &mut bool, user_id: u64, plain: Vec<u8>) {
+    let key = av1_sequence_header(&plain);
+    if *wait_for_keyframe && !key {
+        return;
+    }
+    let job = VideoJob {
+        user_id,
+        plain,
+        reset: *wait_for_keyframe,
+    };
+    match jobs.try_send(job) {
+        Ok(()) => *wait_for_keyframe = false,
+        Err(_) => *wait_for_keyframe = true,
+    }
+}
+
+fn spawn_video_decoder(events: mpsc::Sender<MediaEvent>) -> mpsc::Sender<VideoJob> {
+    let (tx, mut rx) = mpsc::channel::<VideoJob>(8);
+    tokio::spawn(async move {
+        let Ok(mut decoder) = Av1Decoder::new() else {
+            tracing::warn!("av1 decoder unavailable");
+            return;
+        };
+        while let Some(job) = rx.recv().await {
+            if job.reset {
+                if let Ok(fresh) = Av1Decoder::new() {
+                    decoder = fresh;
+                }
+            }
+            let head = job.plain.get(..4).map(|bytes| format!("{bytes:02x?}")).unwrap_or_default();
+            match decoder.decode(&job.plain) {
+                Ok(Some((bgra, width, height))) => {
+                    if frame_has_picture(&bgra) {
+                        note_decoded("video picture");
+                    } else {
+                        note_decoded("video black");
+                    }
+                    let _ = events
+                        .send(MediaEvent::Video {
+                            user_id: job.user_id,
+                            bgra,
+                            width,
+                            height,
+                        })
+                        .await;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    note_reject("av1 decode", format!("{err} head={head}"));
+                    if let Ok(fresh) = Av1Decoder::new() {
+                        decoder = fresh;
+                    }
+                }
+            }
+        }
+    });
+    tx
 }
 
 fn note_packet(kind: &str, payload_type: u8, bytes: usize) {
@@ -667,58 +722,62 @@ async fn handle_video_opcode(
         }
     }
     let video = data.get("video_ssrc").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
-    let active_streams = data
+    let layers = data
         .get("streams")
         .and_then(|value| value.as_array())
         .map(|streams| {
             streams
                 .iter()
-                .filter(|stream| stream.get("active").and_then(|value| value.as_bool()).unwrap_or(false))
                 .filter_map(|stream| {
                     let ssrc = stream.get("ssrc").and_then(|value| value.as_u64())? as u32;
+                    if ssrc == 0 {
+                        return None;
+                    }
                     let quality = stream.get("quality").and_then(|value| value.as_u64()).unwrap_or(100) as u32;
                     let rtx = stream.get("rtx_ssrc").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
-                    Some((ssrc, quality, rtx))
+                    let rid = stream.get("rid").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+                    let active = stream.get("active").and_then(|value| value.as_bool()).unwrap_or(false);
+                    let width = stream.pointer("/max_resolution/width").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+                    let height = stream.pointer("/max_resolution/height").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+                    Some((ssrc, quality, rtx, rid, active, width, height))
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for (_, _, rtx) in &active_streams {
+    for (_, _, rtx, _, _, _, _) in &layers {
         if *rtx != 0 {
             book.rtx.insert(*rtx);
         }
     }
-    let chosen = active_streams
+    let chosen = layers
         .iter()
-        .filter(|(_, quality, _)| *quality <= prefer_quality.max(1))
-        .max_by_key(|(_, quality, _)| *quality)
-        .map(|(ssrc, _, _)| *ssrc)
-        .or_else(|| active_streams.first().map(|(ssrc, _, _)| *ssrc))
+        .filter(|(_, quality, _, _, _, _, _)| *quality <= prefer_quality.max(1))
+        .max_by_key(|(_, quality, _, _, active, width, height)| (*quality, width.saturating_mul(*height), u8::from(*active)))
+        .map(|(ssrc, _, _, _, _, _, _)| *ssrc)
+        .or_else(|| layers.first().map(|(ssrc, _, _, _, _, _, _)| *ssrc))
         .unwrap_or(video);
-    let camera_on = chosen != 0 && (video != 0 || !active_streams.is_empty());
+    let camera_on = chosen != 0 && (video != 0 || !layers.is_empty());
     if video != 0 {
         book.video.insert(video, user_id);
     }
-    for (ssrc, _, _) in &active_streams {
-        if *ssrc != 0 {
-            book.video.insert(*ssrc, user_id);
-        }
+    for (ssrc, _, _, _, _, _, _) in &layers {
+        book.video.insert(*ssrc, user_id);
     }
-    let rtx = active_streams
+    let rtx = layers
         .iter()
-        .find(|(ssrc, _, _)| *ssrc == chosen)
-        .map(|(_, _, rtx)| *rtx)
+        .find(|(ssrc, _, _, _, _, _, _)| *ssrc == chosen)
+        .map(|(_, _, rtx, _, _, _, _)| *rtx)
         .filter(|rtx| *rtx != 0)
         .unwrap_or(0);
     if chosen != 0 {
         remember_video(video_streams, user_id, chosen, rtx);
     }
-    for (ssrc, _, stream_rtx) in &active_streams {
-        if *ssrc != 0 {
-            remember_video(video_streams, user_id, *ssrc, *stream_rtx);
-        }
-    }
-    tracing::info!(video, chosen, streams = active_streams.len(), "video ssrcs");
+    let described = layers
+        .iter()
+        .map(|(ssrc, quality, _, rid, active, width, height)| format!("ssrc={ssrc} rid={rid} q={quality} active={active} {width}x{height}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::info!(video, chosen, layers = layers.len(), described, "video ssrcs");
     if chosen == 0 && video == 0 {
         book.video.retain(|_, owner| *owner != user_id);
         video_streams.retain(|stream| stream.user_id != user_id);
@@ -1009,7 +1068,7 @@ fn sink_wants(quality: u32, video: &[AssignedSsrc]) -> Value {
         }
         let key = stream.ssrc.to_string();
         body.insert(key.clone(), json!(quality));
-        pixels.insert(key, json!(1_920_000));
+        pixels.insert(key, json!(8_294_400));
     }
     if !pixels.is_empty() {
         body.insert("pixelCounts".into(), Value::Object(pixels));

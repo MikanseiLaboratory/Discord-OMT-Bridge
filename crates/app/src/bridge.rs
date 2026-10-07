@@ -247,6 +247,8 @@ struct Seat {
 struct MediaState {
     seats: Vec<Seat>,
     streams: HashMap<String, MediaHandle>,
+    stream_endpoints: HashMap<String, StreamEndpoint>,
+    stream_retry: HashMap<String, Instant>,
     queue: VecDeque<(u64, u64)>,
     awaiting: Option<(u64, u64)>,
     focused: Option<(u64, u64)>,
@@ -284,6 +286,8 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
     let mut media = MediaState {
         seats: Vec::new(),
         streams: HashMap::new(),
+        stream_endpoints: HashMap::new(),
+        stream_retry: HashMap::new(),
         queue: VecDeque::new(),
         awaiting: None,
         focused: None,
@@ -469,7 +473,19 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                             rewatch = media.streams.remove(&key).is_some();
                         }
                         if rewatch {
-                            tracing::info!(%key, "Go Live media dropped; watching again");
+                            let due = media
+                                .stream_retry
+                                .get(&key)
+                                .is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
+                            if due {
+                                media.stream_retry.insert(key.clone(), Instant::now());
+                                if let Some(endpoint) = media.stream_endpoints.get(&key).cloned() {
+                                    if let Some(handle) = open_stream(&session.config, self_id, &mut media, endpoint, bus_tx.clone()) {
+                                        media.streams.insert(key.clone(), handle);
+                                    }
+                                }
+                            }
+                            tracing::info!("Go Live media dropped; watching again");
                             commands
                                 .send(GatewayCommand::WatchStream { stream_key: key.clone() })
                                 .await?;
@@ -841,6 +857,7 @@ async fn handle_gateway(
             if endpoint.paused || !config.allows(endpoint.user_id) {
                 return Ok(());
             }
+            media.stream_endpoints.insert(endpoint.stream_key.clone(), endpoint.clone());
             if media.streams.contains_key(&endpoint.stream_key) {
                 return Ok(());
             }
@@ -872,6 +889,8 @@ async fn handle_gateway(
             }
         }
         GatewayEvent::StreamEnded { stream_key } => {
+            media.stream_endpoints.remove(&stream_key);
+            media.stream_retry.remove(&stream_key);
             if let Some(handle) = media.streams.remove(&stream_key) {
                 handle.cancel.cancel();
             }
@@ -997,6 +1016,22 @@ fn start_voice(
         prefer_quality: config.prefer_quality,
     });
     forward_media(handle, bus_tx, VoiceRoute::Channel(channel_id))
+}
+
+fn open_stream(
+    config: &Config,
+    self_id: u64,
+    media: &MediaState,
+    endpoint: StreamEndpoint,
+    bus_tx: mpsc::Sender<Bus>,
+) -> Option<MediaHandle> {
+    let (guild_id, channel_id, _) = discord_user_gateway::parse_stream_key(&endpoint.stream_key)?;
+    let session_id = media
+        .seats
+        .iter()
+        .find(|seat| seat.guild_id == guild_id && seat.channel_id == channel_id && !seat.session_id.is_empty())
+        .map(|seat| seat.session_id.clone())?;
+    Some(start_stream(config, self_id, channel_id, &session_id, endpoint, bus_tx))
 }
 
 fn start_stream(

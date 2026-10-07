@@ -18,4 +18,4 @@ tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 webrtc = { workspace = true }
-rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rav1d = { version = "1.1.0", default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }

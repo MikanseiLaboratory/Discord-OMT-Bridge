@@ -423,11 +423,11 @@ impl SourceRouter {
 
     fn remember_preview(&mut self, user_id: u64, kind: SourceKind, bgra: &[u8], width: u32, height: u32) {
         if let Some(slot) = self.previews.iter().find(|slot| slot.user_id == user_id && slot.kind == kind) {
-            if slot.at.elapsed() < Duration::from_millis(120) {
+            if slot.at.elapsed() < Duration::from_millis(200) {
                 return;
             }
         }
-        let (width, height, rgba) = downscale_bgra_to_rgba(bgra, width, height, 480);
+        let (width, height, rgba) = downscale_bgra_to_rgba(bgra, width, height, 960);
         if rgba.is_empty() {
             return;
         }
