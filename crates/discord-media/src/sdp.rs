@@ -205,11 +205,14 @@ pub fn synthesize_answer(
             out.push_str(&format!("a={candidate}\r\n"));
         }
         out.push_str("a=rtcp-mux\r\n");
-        let first_audio = section.kind == "audio" && audio_index == 0;
-        let assigned = if section.kind == "audio" {
+        let audio_stream = if section.kind == "audio" {
+            let stream = audio.get(audio_index).copied();
             audio_index += 1;
+            stream
+        } else {
             None
-        } else if section.kind == "video" {
+        };
+        let video_stream = if section.kind == "video" {
             let stream = video.get(video_index).copied();
             video_index += 1;
             stream
@@ -217,15 +220,18 @@ pub fn synthesize_answer(
             None
         };
         // The first audio m-line stays sendonly even before an SSRC is known.
-        // inactive tells the SFU not to forward Opus at all.
-        let direction = if first_audio {
+        // A later audio m-line is sendonly only for the one speaker assigned to it.
+        // inactive tells the receiver not to arm that transceiver.
+        let first_audio = section.kind == "audio" && audio_index == 1;
+        let direction = if first_audio || audio_stream.is_some() {
             "sendonly"
         } else if section.kind == "audio" {
             "inactive"
         } else {
-            answer_direction(&section.direction, assigned.is_some())
+            answer_direction(&section.direction, video_stream.is_some())
         };
         out.push_str(&format!("a={direction}\r\n"));
+        let mut copied_fmtp = false;
         for line in local_offer.lines() {
             let line = line.trim();
             if line.starts_with("a=rtpmap:") || line.starts_with("a=fmtp:") || line.starts_with("a=rtcp-fb:") {
@@ -235,6 +241,9 @@ pub fn synthesize_answer(
                             .is_some_and(|rest| rest.starts_with(payload))
                     })
                 {
+                    if line.starts_with("a=fmtp:") {
+                        copied_fmtp = true;
+                    }
                     out.push_str(line);
                     out.push_str("\r\n");
                 }
@@ -242,32 +251,37 @@ pub fn synthesize_answer(
         }
         if section.kind == "audio" {
             if let Some(opus) = section.payloads.first() {
-                if !out.contains(&format!("a=fmtp:{opus}")) {
+                if !copied_fmtp {
                     out.push_str(&format!("a=fmtp:{opus} minptime=10;useinbandfec=1\r\n"));
                 }
                 out.push_str("a=maxptime:60\r\n");
             }
         }
-        if first_audio {
-            for stream in audio {
-                let label = format!("a{}-{}", stream.user_id, stream.ssrc);
-                out.push_str(&format!("a=msid:{label} {label}\r\n"));
-                out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.ssrc));
-            }
+        if let Some(stream) = audio_stream {
+            write_audio_source(&mut out, stream);
         }
-        if let Some(stream) = assigned {
+        if let Some(stream) = video_stream {
             let label = format!("v{}-{}", stream.user_id, stream.ssrc);
             out.push_str(&format!("a=msid:{label} {label}\r\n"));
             if stream.rtx != 0 {
                 out.push_str(&format!("a=ssrc-group:FID {} {}\r\n", stream.ssrc, stream.rtx));
             }
             out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.ssrc));
+            out.push_str(&format!("a=ssrc:{} msid:{label} {label}\r\n", stream.ssrc));
             if stream.rtx != 0 {
                 out.push_str(&format!("a=ssrc:{} cname:{label}\r\n", stream.rtx));
             }
         }
     }
     Some(out)
+}
+
+fn write_audio_source(out: &mut String, stream: AssignedSsrc) {
+    let stream_id = format!("a{}-{}", stream.user_id, stream.ssrc);
+    let track_id = format!("a{}-{}", stream.user_id, stream.ssrc);
+    out.push_str(&format!("a=msid:{stream_id} {track_id}\r\n"));
+    out.push_str(&format!("a=ssrc:{} cname:{stream_id}\r\n", stream.ssrc));
+    out.push_str(&format!("a=ssrc:{} msid:{stream_id} {track_id}\r\n", stream.ssrc));
 }
 
 fn answer_direction(offer: &str, has_remote: bool) -> &'static str {
@@ -371,11 +385,12 @@ c=IN IP4 127.0.0.1\r
         .unwrap();
         assert_eq!(answer.matches("m=").count(), 2);
         assert!(answer.contains("a=ssrc:42 cname:v7-42"));
+        assert!(answer.contains("a=ssrc:42 msid:v7-42 v7-42"));
         assert!(answer.contains("a=ssrc-group:FID 42 43"));
         let audio = answer.split("m=video").next().unwrap_or("");
         assert!(audio.contains("a=sendonly"));
         assert!(audio.contains("a=ssrc:11 cname:a1-11"));
-        assert!(audio.contains("a=ssrc:22 cname:a2-22"));
+        assert!(!audio.contains("a=ssrc:22"));
         assert!(!audio.contains("a=inactive"));
         let video = answer.split("m=video").nth(1).unwrap_or("");
         assert!(video.contains("a=sendonly"));
@@ -383,6 +398,83 @@ c=IN IP4 127.0.0.1\r
         assert!(answer.contains("a=ice-ufrag:remote"));
         let media = answer.split_once("m=").map(|(_, rest)| rest).unwrap_or("");
         assert!(media.contains("a=candidate:1 1 udp 1 127.0.0.1 50000 typ host"));
+    }
+
+    #[test]
+    fn audio_ssrcs_use_separate_mids() {
+        let offer = "\
+v=0\r
+o=- 0 0 IN IP4 127.0.0.1\r
+s=-\r
+t=0 0\r
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r
+a=mid:0\r
+a=recvonly\r
+a=rtpmap:111 opus/48000/2\r
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r
+a=mid:1\r
+a=recvonly\r
+a=rtpmap:111 opus/48000/2\r
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r
+a=mid:2\r
+a=recvonly\r
+a=rtpmap:111 opus/48000/2\r
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r
+a=mid:3\r
+a=recvonly\r
+a=rtpmap:111 opus/48000/2\r
+m=video 9 UDP/TLS/RTP/SAVPF 102\r
+a=mid:4\r
+a=recvonly\r
+a=rtpmap:102 H264/90000\r
+";
+        let server = "\
+a=ice-ufrag:remote\r
+a=ice-pwd:remotepwd\r
+a=fingerprint:sha-256 CC:DD\r
+a=candidate:1 1 udp 1 127.0.0.1 50000 typ host\r
+c=IN IP4 127.0.0.1\r
+";
+        let answer = synthesize_answer(
+            offer,
+            server,
+            &[
+                AssignedSsrc { user_id: 1, ssrc: 11, rtx: 0 },
+                AssignedSsrc { user_id: 2, ssrc: 22, rtx: 0 },
+            ],
+            &[AssignedSsrc { user_id: 7, ssrc: 42, rtx: 0 }],
+        )
+        .unwrap();
+        assert_eq!(answer.matches("m=").count(), 5);
+        let mut sections = answer.split("m=").skip(1);
+        let first = sections.next().unwrap();
+        let second = sections.next().unwrap();
+        let third = sections.next().unwrap();
+        let fourth = sections.next().unwrap();
+        assert!(first.contains("a=mid:0"));
+        assert!(first.contains("a=sendonly"));
+        assert!(first.contains("a=ssrc:11 cname:a1-11"));
+        assert!(first.contains("a=ssrc:11 msid:a1-11 a1-11"));
+        assert!(!first.contains("a=ssrc:22"));
+        assert!(second.contains("a=mid:1"));
+        assert!(second.contains("a=sendonly"));
+        assert!(second.contains("a=ssrc:22 cname:a2-22"));
+        assert!(!second.contains("a=ssrc:11"));
+        assert!(third.contains("a=mid:2"));
+        assert!(third.contains("a=inactive"));
+        assert!(!third.contains("a=ssrc:"));
+        assert!(fourth.contains("a=inactive"));
+        let replaced = synthesize_answer(
+            offer,
+            server,
+            &[AssignedSsrc { user_id: 1, ssrc: 99, rtx: 0 }],
+            &[],
+        )
+        .unwrap();
+        let first = replaced.split("m=").nth(1).unwrap();
+        assert!(first.contains("a=ssrc:99 cname:a1-99"));
+        assert!(!first.contains("a=ssrc:11"));
+        assert!(!replaced.contains("a=ssrc:22"));
     }
 
     #[test]

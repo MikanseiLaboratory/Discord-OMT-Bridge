@@ -307,6 +307,7 @@ struct Seat {
     channel_id: u64,
     voice: Option<MediaHandle>,
     session_id: String,
+    voice_endpoint: String,
     connected: bool,
 }
 
@@ -700,6 +701,7 @@ fn ensure_seat(media: &mut MediaState, guild_id: u64, channel_id: u64) {
         channel_id,
         voice: None,
         session_id: String::new(),
+        voice_endpoint: String::new(),
         connected: false,
     });
     media.focused = Some((guild_id, channel_id));
@@ -1105,12 +1107,19 @@ fn attach_voice(
         }
         return Ok(());
     };
-    if let Some(handle) = seat.voice.take() {
-        handle.cancel.cancel();
+    let same_session = seat.voice.is_some() && seat.session_id == endpoint.session_id && seat.voice_endpoint == endpoint.endpoint;
+    if same_session {
+        tracing::info!("voice session is already connected");
+    } else {
+        if let Some(handle) = seat.voice.take() {
+            handle.cancel.cancel();
+            tracing::info!("replacing the voice connection");
+        }
+        seat.session_id = endpoint.session_id.clone();
+        seat.voice_endpoint = endpoint.endpoint.clone();
+        seat.connected = true;
+        seat.voice = Some(start_voice(config, self_id, channel_id, endpoint, bus_tx.clone()));
     }
-    seat.session_id = endpoint.session_id.clone();
-    seat.connected = true;
-    seat.voice = Some(start_voice(config, self_id, channel_id, endpoint, bus_tx.clone()));
     if matches_awaiting {
         media.awaiting = None;
     }
@@ -1330,6 +1339,15 @@ fn idle_pictures() -> watch::Receiver<Option<VideoPicture>> {
     watch::channel(None).1
 }
 
+fn note_voice_pcm(channel_id: u64, user_id: u64, samples: usize) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n % 250 == 0 {
+        tracing::info!(channel_id, user_id, samples, "voice pcm");
+    }
+}
+
 fn apply_media(
     config: &Config,
     router: &mut SourceRouter,
@@ -1346,6 +1364,9 @@ fn apply_media(
                 SourceKind::GoLive
             };
             router.publish_audio(config, channel_id, *user_id, source, pcm, *sample_rate, *channels);
+            if kind == MediaKind::Voice {
+                note_voice_pcm(channel_id, *user_id, pcm.len());
+            }
         }
         MediaEvent::Video { user_id, bgra, width, height } if *user_id != self_id => {
             let source = if kind == MediaKind::Voice {

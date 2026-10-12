@@ -19,3 +19,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 webrtc = { workspace = true }
 rav1d = { version = "1.1.0", default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }
+
+[[test]]
+name = "av1_proc"
+harness = false

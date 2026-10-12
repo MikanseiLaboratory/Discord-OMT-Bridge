@@ -4,6 +4,7 @@ mod router;
 mod snapshot;
 
 pub use bridge::{run, spawn_session, BridgeHandle};
+pub use discord_media::maybe_run_av1_worker;
 pub use discord_user_gateway::{
     login_password, send_login_sms, submit_mfa, AuthStep, CaptchaAnswer, CaptchaChallenge,
 };

@@ -29,8 +29,15 @@ enum Command {
     },
 }
 
+fn main() -> anyhow::Result<()> {
+    if discord_omt_bridge::maybe_run_av1_worker() {
+        return Ok(());
+    }
+    cli_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn cli_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

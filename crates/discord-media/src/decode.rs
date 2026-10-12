@@ -1,15 +1,6 @@
-use std::ffi::c_void;
-use std::ptr::NonNull;
-
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use opus::{Channels, Decoder as OpusNative};
-use rav1d::include::dav1d::data::Dav1dData;
-use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
-use rav1d::include::dav1d::headers::{DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422, DAV1D_PIXEL_LAYOUT_I444};
-use rav1d::include::dav1d::picture::Dav1dPicture;
-use rav1d::src::lib::{dav1d_close, dav1d_data_unref, dav1d_data_wrap, dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data};
-use rav1d::src::send_sync_non_null::SendSyncNonNull;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -75,158 +66,6 @@ impl H264Decoder {
         }
         let bgra = yuv_to_bgra(&yuv);
         Ok(Some((bgra, width as u32, height as u32)))
-    }
-}
-
-pub struct Av1Decoder {
-    ctx: Option<Dav1dContext>,
-}
-
-// The context is an internally reference-counted pointer. The connection task
-// owns it and tokio only moves that task between threads.
-unsafe impl Send for Av1Decoder {}
-
-impl Av1Decoder {
-    pub fn new() -> Result<Self, DecodeError> {
-        let mut settings = unsafe {
-            let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
-            dav1d_default_settings(NonNull::new_unchecked(settings.as_mut_ptr()));
-            settings.assume_init()
-        };
-        // One worker thread hits a rav1d bug: a bad frame unwraps a missing
-        // frame header and aborts the process. Extra threads take the path
-        // that returns the error, and they keep 1080p closer to realtime.
-        let threads = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
-        settings.n_threads = i32::try_from(threads.clamp(4, 8)).unwrap_or(4);
-        settings.max_frame_delay = 1;
-        let mut ctx = None;
-        let status = unsafe { dav1d_open(NonNull::new(&mut ctx), NonNull::new(&mut settings)) };
-        if status.0 != 0 || ctx.is_none() {
-            return Err(DecodeError::Av1(format!("decoder open failed ({})", status.0)));
-        }
-        Ok(Self { ctx })
-    }
-
-    pub fn decode(&mut self, obu: &[u8]) -> Result<Option<(Vec<u8>, u32, u32)>, DecodeError> {
-        if obu.is_empty() {
-            return Ok(None);
-        }
-        let mut held = None;
-        if !self.send(obu)? {
-            held = self.pull()?;
-            if !self.send(obu)? {
-                return Err(DecodeError::Av1("decoder queue stayed full".into()));
-            }
-        }
-        Ok(self.pull()?.or(held))
-    }
-
-    fn send(&mut self, obu: &[u8]) -> Result<bool, DecodeError> {
-        let bytes = obu.to_vec();
-        let len = bytes.len();
-        let mut data = Dav1dData::default();
-        let boxed = Box::new(bytes);
-        let ptr = NonNull::new(boxed.as_ptr() as *mut u8).ok_or_else(|| DecodeError::Av1("empty obu".into()))?;
-        let cookie = SendSyncNonNull::from_box(boxed).cast::<c_void>();
-        let wrapped = unsafe { dav1d_data_wrap(NonNull::new(&mut data), Some(ptr), len, Some(free_obu), Some(cookie)) };
-        if wrapped.0 != 0 {
-            unsafe { free_obu(ptr.as_ptr(), Some(cookie)) };
-            return Err(DecodeError::Av1(format!("wrap failed ({})", wrapped.0)));
-        }
-        let status = unsafe { dav1d_send_data(self.ctx.clone(), NonNull::new(&mut data)) };
-        if status.0 == 0 {
-            return Ok(true);
-        }
-        unsafe { dav1d_data_unref(NonNull::new(&mut data)) };
-        if status.0 == -11 {
-            return Ok(false);
-        }
-        Err(DecodeError::Av1(format!("send failed ({})", status.0)))
-    }
-
-    fn pull(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, DecodeError> {
-        let mut picture = Dav1dPicture::default();
-        let status = unsafe { dav1d_get_picture(self.ctx.clone(), NonNull::new(&mut picture)) };
-        if status.0 == -11 {
-            return Ok(None);
-        }
-        if status.0 != 0 {
-            return Err(DecodeError::Av1(format!("picture failed ({})", status.0)));
-        }
-        let frame = picture_bgra(&picture);
-        unsafe { dav1d_picture_unref(NonNull::new(&mut picture)) };
-        frame
-    }
-}
-
-impl Drop for Av1Decoder {
-    fn drop(&mut self) {
-        if self.ctx.is_some() {
-            unsafe { dav1d_close(NonNull::new(&mut self.ctx)) };
-        }
-    }
-}
-
-unsafe extern "C" fn free_obu(_ptr: *const u8, cookie: Option<SendSyncNonNull<c_void>>) {
-    if let Some(cookie) = cookie {
-        drop(Box::from_raw(cookie.as_ptr().as_ptr() as *mut Vec<u8>));
-    }
-}
-
-fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, DecodeError> {
-    let width = picture.p.w;
-    let height = picture.p.h;
-    if width <= 0 || height <= 0 || width > 3840 || height > 2160 {
-        return Ok(None);
-    }
-    let width = width as usize;
-    let height = height as usize;
-    let layout = picture.p.layout;
-    let bpc = picture.p.bpc.max(8) as usize;
-    let y = picture.data[0].ok_or_else(|| DecodeError::Av1("picture has no luma".into()))?;
-    let stride_y = picture.stride[0];
-    let (ss_x, ss_y) = match layout {
-        DAV1D_PIXEL_LAYOUT_I400 => (0, 0),
-        DAV1D_PIXEL_LAYOUT_I420 => (1, 1),
-        DAV1D_PIXEL_LAYOUT_I422 => (1, 0),
-        DAV1D_PIXEL_LAYOUT_I444 => (0, 0),
-        other => return Err(DecodeError::Av1(format!("unsupported layout {other}"))),
-    };
-    let u = picture.data[1];
-    let v = picture.data[2];
-    let stride_uv = picture.stride[1];
-    let mut bgra = vec![0u8; width * height * 4];
-    for row in 0..height {
-        for col in 0..width {
-            let y_value = plane_sample(y.as_ptr(), stride_y, col, row, bpc) as i32;
-            let (u_value, v_value) = if layout == DAV1D_PIXEL_LAYOUT_I400 {
-                (128, 128)
-            } else {
-                let Some(u) = u else { return Err(DecodeError::Av1("picture has no chroma".into())); };
-                let Some(v) = v else { return Err(DecodeError::Av1("picture has no chroma".into())); };
-                (
-                    plane_sample(u.as_ptr(), stride_uv, col >> ss_x, row >> ss_y, bpc) as i32,
-                    plane_sample(v.as_ptr(), stride_uv, col >> ss_x, row >> ss_y, bpc) as i32,
-                )
-            };
-            let (b, g, r) = yuv_to_rgb(y_value, u_value, v_value);
-            let offset = (row * width + col) * 4;
-            bgra[offset] = b;
-            bgra[offset + 1] = g;
-            bgra[offset + 2] = r;
-            bgra[offset + 3] = 255;
-        }
-    }
-    Ok(Some((bgra, width as u32, height as u32)))
-}
-
-fn plane_sample(data: *const c_void, stride: isize, x: usize, y: usize, bpc: usize) -> u8 {
-    let row = unsafe { (data as *const u8).offset(stride * y as isize) };
-    if bpc <= 8 {
-        unsafe { *row.add(x) }
-    } else {
-        let sample = unsafe { *(row as *const u16).add(x) };
-        (sample >> (bpc - 8)) as u8
     }
 }
 
@@ -402,7 +241,35 @@ fn write_leb128(mut value: usize, out: &mut Vec<u8>) {
     }
 }
 
-fn read_leb128(data: &[u8]) -> Option<(usize, usize)> {
+/// True when any sized OBU in the access unit is a sequence header.
+/// A fresh rav1d context aborts if the first frame has no sequence header.
+pub(crate) fn contains_av1_sequence_header(frame: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < frame.len() {
+        let header = frame[index];
+        let obu_type = (header >> 3) & 0x0f;
+        if obu_type == 1 {
+            return true;
+        }
+        index += 1;
+        if header & 0x04 != 0 {
+            if index >= frame.len() {
+                return false;
+            }
+            index += 1;
+        }
+        if header & 0x02 == 0 {
+            return false;
+        }
+        let Some((size, used)) = read_leb128(&frame[index..]) else {
+            return false;
+        };
+        index = index.saturating_add(used).saturating_add(size);
+    }
+    false
+}
+
+pub(crate) fn read_leb128(data: &[u8]) -> Option<(usize, usize)> {
     let mut value = 0usize;
     for index in 0..8 {
         let byte = *data.get(index)?;
