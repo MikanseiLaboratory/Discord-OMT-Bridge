@@ -46,6 +46,8 @@ pub struct ConnectParams {
     pub server_id: u64,
     pub user_id: u64,
     pub channel_id: u64,
+    /// Stream Create `rtc_channel_id`. Zero on a normal voice connection.
+    pub rtc_channel_id: u64,
     pub kind: MediaKind,
     pub max_video_slots: usize,
     pub prefer_quality: u32,
@@ -228,11 +230,11 @@ async fn run_connection(
                     }
                     keyframe_requests = keyframe_requests.saturating_add(1);
                     let ready = peer_ready.load(std::sync::atomic::Ordering::Relaxed);
-                    // A PLI sent before SRTP is up uses an invalid sender SSRC and
-                    // Discord sometimes stops forwarding video while leaving audio up.
+                    // A PLI before the first video packet makes the stream server
+                    // keep Go Live audio and never open the video track. Ask only
+                    // after a decoder is actually waiting on a keyframe.
                     if ready && video_since.is_none() {
                         video_since = Some(Instant::now());
-                        request_pli = true;
                     }
                     if ready && !logged_receivers {
                         logged_receivers = true;
@@ -311,18 +313,24 @@ async fn run_connection(
                                     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
                                 }
                                 heartbeats_started = true;
-                                let identify = json!({
-                                    "op": 0,
-                                    "d": {
-                                        "server_id": params.server_id.to_string(),
-                                        "user_id": params.user_id.to_string(),
-                                        "session_id": params.session_id,
-                                        "token": params.token,
-                                        "video": true,
-                                        "streams": [{ "type": "video", "rid": "100", "quality": 100 }],
-                                        "max_dave_protocol_version": DAVE_VERSION
-                                    }
+                                let mut identify_data = json!({
+                                    "server_id": params.server_id.to_string(),
+                                    "user_id": params.user_id.to_string(),
+                                    "session_id": params.session_id,
+                                    "token": params.token,
+                                    "video": true,
+                                    "max_dave_protocol_version": DAVE_VERSION
                                 });
+                                if params.kind == MediaKind::GoLive {
+                                    if params.rtc_channel_id > 0 {
+                                        identify_data["channel_id"] =
+                                            json!(params.rtc_channel_id.to_string());
+                                    }
+                                } else {
+                                    identify_data["streams"] =
+                                        json!([{ "type": "video", "rid": "100", "quality": 100 }]);
+                                }
+                                let identify = json!({ "op": 0, "d": identify_data });
                                 socket.send(Message::Text(identify.to_string().into())).await?;
                             }
                             2 => {
@@ -342,7 +350,7 @@ async fn run_connection(
                                     }
                                 });
                                 socket.send(Message::Text(select.to_string().into())).await?;
-                                if local_audio_ssrc != 0 {
+                                if params.kind != MediaKind::GoLive && local_audio_ssrc != 0 {
                                     let announce = inactive_video(local_audio_ssrc, &ready_streams);
                                     video_announce = Some(announce.to_string());
                                     socket.send(Message::Text(announce.to_string().into())).await?;
@@ -391,7 +399,7 @@ async fn run_connection(
                                 if let Some(announce) = &video_announce {
                                     socket.send(Message::Text(announce.clone().into())).await?;
                                 }
-                                if local_audio_ssrc != 0 {
+                                if params.kind != MediaKind::GoLive && local_audio_ssrc != 0 {
                                     socket.send(Message::Text(register_speaking(local_audio_ssrc).to_string().into())).await?;
                                 }
                             }

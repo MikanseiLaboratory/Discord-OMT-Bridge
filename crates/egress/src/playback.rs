@@ -6,7 +6,6 @@ use std::thread::{self, JoinHandle};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, Stream, StreamConfig};
 
-
 const RING_SECONDS: u32 = 1;
 
 #[derive(Clone, Debug)]
@@ -21,7 +20,11 @@ pub enum SpeakerTarget {
     /// One stereo stream on the default host (WASAPI on Windows).
     Device { name: String },
     /// A channel range on the shared ASIO device. `start` is 1-based.
-    Asio { name: String, start: u16, count: u16 },
+    Asio {
+        name: String,
+        start: u16,
+        count: u16,
+    },
 }
 
 pub fn asio_available() -> bool {
@@ -66,7 +69,9 @@ impl PlaybackEngine {
                 reply: reply_tx,
             })
             .map_err(|_| "音声出力が停止しています".to_owned())?;
-        reply_rx.recv().map_err(|_| "音声出力が停止しています".to_owned())?
+        reply_rx
+            .recv()
+            .map_err(|_| "音声出力が停止しています".to_owned())?
     }
 
     pub fn unbind(&self, id: &str) {
@@ -156,7 +161,12 @@ fn worker(rx: Receiver<Command>) {
                 let _ = reply.send(worker.bind(id, target));
             }
             Command::Unbind { id } => worker.unbind(&id),
-            Command::Pcm { id, pcm, sample_rate, channels } => worker.push(&id, &pcm, sample_rate, channels),
+            Command::Pcm {
+                id,
+                pcm,
+                sample_rate,
+                channels,
+            } => worker.push(&id, &pcm, sample_rate, channels),
         }
     }
 }
@@ -186,10 +196,20 @@ impl Worker {
                 },
             );
         }
-        let stream = match open_wasapi_stream(&device, &config, format, channels, Arc::clone(&self.state), id.clone()) {
+        let stream = match open_wasapi_stream(
+            &device,
+            &config,
+            format,
+            channels,
+            Arc::clone(&self.state),
+            id.clone(),
+        ) {
             Ok(stream) => stream,
             Err(err) => {
-                let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
                 state.wasapi.remove(&id);
                 return Err(err);
             }
@@ -206,7 +226,8 @@ impl Worker {
         }
         #[cfg(all(windows, feature = "asio"))]
         {
-            let host = asio_host().ok_or_else(|| "ASIO を開けません。ASIO SDK 付きでビルドしてください".to_owned())?;
+            let host = asio_host()
+                .ok_or_else(|| "ASIO を開けません。ASIO SDK 付きでビルドしてください".to_owned())?;
             let device = output_device(&host, name)?;
             let resolved = device.name().map_err(|err| err.to_string())?;
             let (config, format) = stream_config(&device, 0)?;
@@ -215,14 +236,18 @@ impl Worker {
             let start = start.max(1) as usize - 1;
             let count = count.max(1) as usize;
             if start >= channels {
-                return Err(format!("ASIO の開始チャンネルがデバイスの {channels} チャンネルを超えています"));
+                return Err(format!(
+                    "ASIO の開始チャンネルがデバイスの {channels} チャンネルを超えています"
+                ));
             }
             let mut created = false;
             {
                 let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
                 let mix = state.asio.entry(resolved.clone()).or_insert_with(|| {
                     created = true;
-                    AsioMix { tracks: HashMap::new() }
+                    AsioMix {
+                        tracks: HashMap::new(),
+                    }
                 });
                 mix.tracks.insert(
                     id,
@@ -235,10 +260,20 @@ impl Worker {
                 );
             }
             if created {
-                match open_asio_stream(&device, &config, format, channels, Arc::clone(&self.state), resolved.clone()) {
+                match open_asio_stream(
+                    &device,
+                    &config,
+                    format,
+                    channels,
+                    Arc::clone(&self.state),
+                    resolved.clone(),
+                ) {
                     Ok(stream) => self.asio_streams.insert(resolved, stream),
                     Err(err) => {
-                        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
                         state.asio.remove(&resolved);
                         return Err(err);
                     }
@@ -294,15 +329,24 @@ fn list_host(host_name: &'static str, host: &cpal::Host) -> Vec<ListedDevice> {
     devices
         .filter_map(|device| {
             let name = device.name().ok()?;
-            let channels = device.default_output_config().map(|config| config.channels()).unwrap_or(2);
-            Some(ListedDevice { name, host: host_name, channels })
+            let channels = device
+                .default_output_config()
+                .map(|config| config.channels())
+                .unwrap_or(2);
+            Some(ListedDevice {
+                name,
+                host: host_name,
+                channels,
+            })
         })
         .collect()
 }
 
 fn output_device(host: &cpal::Host, name: &str) -> Result<cpal::Device, String> {
     if name.is_empty() {
-        return host.default_output_device().ok_or_else(|| "再生デバイスがありません".to_owned());
+        return host
+            .default_output_device()
+            .ok_or_else(|| "再生デバイスがありません".to_owned());
     }
     let mut devices = host.output_devices().map_err(|err| err.to_string())?;
     devices
@@ -310,9 +354,18 @@ fn output_device(host: &cpal::Host, name: &str) -> Result<cpal::Device, String> 
         .ok_or_else(|| format!("再生デバイスが見つかりません: {name}"))
 }
 
-fn stream_config(device: &cpal::Device, channels: u16) -> Result<(StreamConfig, SampleFormat), String> {
-    let default = device.default_output_config().map_err(|err| err.to_string())?;
-    let want = if channels == 0 { default.channels() } else { channels };
+fn stream_config(
+    device: &cpal::Device,
+    channels: u16,
+) -> Result<(StreamConfig, SampleFormat), String> {
+    let default = device
+        .default_output_config()
+        .map_err(|err| err.to_string())?;
+    let want = if channels == 0 {
+        default.channels()
+    } else {
+        channels
+    };
     if let Ok(ranges) = device.supported_output_configs() {
         for range in ranges {
             if range.channels() != want || range.sample_format() != SampleFormat::F32 {
@@ -320,7 +373,11 @@ fn stream_config(device: &cpal::Device, channels: u16) -> Result<(StreamConfig, 
             }
             let max = range.max_sample_rate().0;
             let min = range.min_sample_rate().0;
-            let rate = if (min..=max).contains(&48_000) { 48_000 } else { default.sample_rate().0.clamp(min, max) };
+            let rate = if (min..=max).contains(&48_000) {
+                48_000
+            } else {
+                default.sample_rate().0.clamp(min, max)
+            };
             let supported = range.with_sample_rate(SampleRate(rate));
             return Ok((supported.into(), SampleFormat::F32));
         }
@@ -358,7 +415,11 @@ fn open_wasapi_stream(
                 None,
             )
         }
-        other => return Err(format!("再生デバイスのサンプル形式 {other:?} には対応していません")),
+        other => {
+            return Err(format!(
+                "再生デバイスのサンプル形式 {other:?} には対応していません"
+            ))
+        }
     };
     let stream = stream.map_err(|err| err.to_string())?;
     stream.play().map_err(|err| err.to_string())?;
@@ -396,7 +457,11 @@ fn open_asio_stream(
                 None,
             )
         }
-        other => return Err(format!("ASIO のサンプル形式 {other:?} には対応していません")),
+        other => {
+            return Err(format!(
+                "ASIO のサンプル形式 {other:?} には対応していません"
+            ))
+        }
     };
     let stream = stream.map_err(|err| err.to_string())?;
     stream.play().map_err(|err| err.to_string())?;
@@ -440,13 +505,23 @@ fn fill_asio(state: &Mutex<EngineState>, device: &str, output: &mut [f32], chann
         for track in mix.tracks.values_mut() {
             let left = track.samples.pop_front().unwrap_or(0.0);
             let right = track.samples.pop_front().unwrap_or(0.0);
-            mix_stereo_into(output, channels, frame, track.start, track.count, left, right);
+            mix_stereo_into(
+                output,
+                channels,
+                frame,
+                track.start,
+                track.count,
+                left,
+                right,
+            );
         }
     }
 }
 
 fn ring_capacity(rate: u32) -> usize {
-    (rate.max(1) as usize).saturating_mul(2).saturating_mul(RING_SECONDS as usize)
+    (rate.max(1) as usize)
+        .saturating_mul(2)
+        .saturating_mul(RING_SECONDS as usize)
 }
 
 fn push_stereo(samples: &mut VecDeque<f32>, pcm: &[f32], capacity: usize) {
@@ -465,7 +540,11 @@ fn pcm_to_stereo(pcm: &[i16], channels: u16) -> Vec<f32> {
     let mut out = Vec::with_capacity(pcm.len() / channels * 2);
     for frame in pcm.chunks_exact(channels) {
         let left = frame[0] as f32 / scale;
-        let right = if channels == 1 { left } else { frame[1] as f32 / scale };
+        let right = if channels == 1 {
+            left
+        } else {
+            frame[1] as f32 / scale
+        };
         out.push(left);
         out.push(right);
     }
@@ -480,7 +559,8 @@ fn resample_stereo(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
         return input.to_vec();
     }
     let in_frames = input.len() / 2;
-    let out_frames = ((in_frames as u64 * u64::from(out_rate)) / u64::from(in_rate)).max(1) as usize;
+    let out_frames =
+        ((in_frames as u64 * u64::from(out_rate)) / u64::from(in_rate)).max(1) as usize;
     let mut out = Vec::with_capacity(out_frames * 2);
     for frame in 0..out_frames {
         let position = frame as f64 * f64::from(in_rate) / f64::from(out_rate);
@@ -496,7 +576,15 @@ fn resample_stereo(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     out
 }
 
-pub fn mix_stereo_into(output: &mut [f32], channels: usize, frame: usize, start: usize, count: usize, left: f32, right: f32) {
+pub fn mix_stereo_into(
+    output: &mut [f32],
+    channels: usize,
+    frame: usize,
+    start: usize,
+    count: usize,
+    left: f32,
+    right: f32,
+) {
     if channels == 0 || count == 0 || start >= channels {
         return;
     }

@@ -122,7 +122,9 @@ enum Snowflake {
 
 pub fn default_settings_path() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("discord-omt-bridge").join("settings.toml")
+    PathBuf::from(base)
+        .join("discord-omt-bridge")
+        .join("settings.toml")
 }
 
 impl Config {

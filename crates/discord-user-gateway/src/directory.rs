@@ -89,8 +89,15 @@ pub fn read_channel(data: &Value) -> Option<ChannelRecord> {
         .and_then(|value| value.as_str())
         .unwrap_or("channel")
         .to_owned();
-    let kind = ChannelKind::from_discord(data.get("type").and_then(|value| value.as_i64()).unwrap_or(-1));
-    let position = data.get("position").and_then(|value| value.as_i64()).unwrap_or(0);
+    let kind = ChannelKind::from_discord(
+        data.get("type")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(-1),
+    );
+    let position = data
+        .get("position")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
     let parent_id = parse_id(data.get("parent_id"));
     Some(ChannelRecord {
         id,

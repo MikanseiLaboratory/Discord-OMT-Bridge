@@ -33,7 +33,7 @@ impl FanoutPublisher {
             None
         };
         let ndi = if enable_ndi {
-            Some(NdiPublisher::open(name)?)
+            Some(NdiPublisher::open(name, video, audio)?)
         } else {
             None
         };

@@ -31,14 +31,18 @@ pub enum AuthStep {
         backup: bool,
     },
     Captcha(CaptchaChallenge),
-    SmsSent { phone: String },
+    SmsSent {
+        phone: String,
+    },
 }
 
 impl std::fmt::Debug for AuthStep {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Token(_) => formatter.write_str("Token(<redacted>)"),
-            Self::Mfa { totp, sms, backup, .. } => formatter
+            Self::Mfa {
+                totp, sms, backup, ..
+            } => formatter
                 .debug_struct("Mfa")
                 .field("ticket", &"<redacted>")
                 .field("totp", totp)
@@ -49,7 +53,10 @@ impl std::fmt::Debug for AuthStep {
                 .debug_struct("Captcha")
                 .field("service", &challenge.service)
                 .finish_non_exhaustive(),
-            Self::SmsSent { phone } => formatter.debug_struct("SmsSent").field("phone", phone).finish(),
+            Self::SmsSent { phone } => formatter
+                .debug_struct("SmsSent")
+                .field("phone", phone)
+                .finish(),
         }
     }
 }
@@ -90,7 +97,11 @@ pub async fn submit_mfa(
     if ticket.is_empty() || code.is_empty() {
         return Err(GatewayError::Message("認証コードを入力してください".into()));
     }
-    let path = if method == "sms" { "/auth/mfa/sms" } else { "/auth/mfa/totp" };
+    let path = if method == "sms" {
+        "/auth/mfa/sms"
+    } else {
+        "/auth/mfa/totp"
+    };
     let mut body = json!({
         "code": code,
         "ticket": ticket,
@@ -109,7 +120,9 @@ pub async fn send_login_sms(
 ) -> Result<AuthStep, GatewayError> {
     let ticket = ticket.trim();
     if ticket.is_empty() {
-        return Err(GatewayError::Message("ログインからやり直してください".into()));
+        return Err(GatewayError::Message(
+            "ログインからやり直してください".into(),
+        ));
     }
     let mut body = json!({ "ticket": ticket });
     attach_captcha(&mut body, captcha.as_ref());
@@ -136,7 +149,11 @@ async fn post_auth(
     build: u32,
     captcha: Option<&CaptchaAnswer>,
 ) -> Result<(u16, Value), GatewayError> {
-    let build = if build == 0 { fetch_build_number().await.unwrap_or(366_000) } else { build };
+    let build = if build == 0 {
+        fetch_build_number().await.unwrap_or(366_000)
+    } else {
+        build
+    };
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(20))
@@ -172,15 +189,23 @@ fn common_headers(
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "X-Super-Properties",
-        super_properties(build).parse().unwrap_or(reqwest::header::HeaderValue::from_static("")),
+        super_properties(build)
+            .parse()
+            .unwrap_or(reqwest::header::HeaderValue::from_static("")),
     );
-    headers.insert("X-Discord-Locale", reqwest::header::HeaderValue::from_static("ja"));
+    headers.insert(
+        "X-Discord-Locale",
+        reqwest::header::HeaderValue::from_static("ja"),
+    );
     if let Some(fingerprint) = fingerprint.filter(|value| !value.is_empty()) {
         if let Ok(value) = fingerprint.parse() {
             headers.insert("X-Fingerprint", value);
         }
     }
-    if let Some(session) = captcha.and_then(|captcha| captcha.session_id.as_deref()).filter(|value| !value.is_empty()) {
+    if let Some(session) = captcha
+        .and_then(|captcha| captcha.session_id.as_deref())
+        .filter(|value| !value.is_empty())
+    {
         if let Ok(value) = session.parse() {
             headers.insert("X-Captcha-Session-Id", value);
         }
@@ -249,26 +274,48 @@ fn read_step(status: u16, body: &Value, sms_send: bool) -> Result<AuthStep, Gate
         return Ok(AuthStep::Captcha(challenge));
     }
     if body.get("mfa").and_then(|value| value.as_bool()) == Some(true) {
-        let ticket = body.get("ticket").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+        let ticket = body
+            .get("ticket")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
         if ticket.is_empty() {
-            return Err(GatewayError::Message("二段階認証を開始できませんでした".into()));
+            return Err(GatewayError::Message(
+                "二段階認証を開始できませんでした".into(),
+            ));
         }
         return Ok(AuthStep::Mfa {
             ticket,
-            totp: body.get("totp").and_then(|value| value.as_bool()).unwrap_or(true),
-            sms: body.get("sms").and_then(|value| value.as_bool()).unwrap_or(false),
-            backup: body.get("backup").and_then(|value| value.as_bool()).unwrap_or(true),
+            totp: body
+                .get("totp")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            sms: body
+                .get("sms")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            backup: body
+                .get("backup")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
         });
     }
     if sms_send && (200..300).contains(&status) {
-        let phone = body.get("phone").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+        let phone = body
+            .get("phone")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned();
         return Ok(AuthStep::SmsSent { phone });
     }
     Err(GatewayError::Message(failure_message(status, body)))
 }
 
 fn captcha_challenge(body: &Value) -> Option<CaptchaChallenge> {
-    let sitekey = body.get("captcha_sitekey").and_then(|value| value.as_str()).unwrap_or("");
+    let sitekey = body
+        .get("captcha_sitekey")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     if sitekey.is_empty() {
         return None;
     }
@@ -279,8 +326,16 @@ fn captcha_challenge(body: &Value) -> Option<CaptchaChallenge> {
             .unwrap_or("hcaptcha")
             .to_owned(),
         sitekey: sitekey.to_owned(),
-        rqdata: body.get("captcha_rqdata").and_then(|value| value.as_str()).unwrap_or("").to_owned(),
-        rqtoken: body.get("captcha_rqtoken").and_then(|value| value.as_str()).unwrap_or("").to_owned(),
+        rqdata: body
+            .get("captcha_rqdata")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        rqtoken: body
+            .get("captcha_rqtoken")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned(),
         session_id: body
             .get("captcha_session_id")
             .and_then(|value| value.as_str())
@@ -290,7 +345,10 @@ fn captcha_challenge(body: &Value) -> Option<CaptchaChallenge> {
 }
 
 fn failure_message(status: u16, body: &Value) -> String {
-    let code = body.get("code").and_then(|value| value.as_u64()).unwrap_or(0);
+    let code = body
+        .get("code")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
     let blob = body.to_string();
     if status == 429 {
         return "ログインの試行が多すぎます。しばらく待ってからもう一度試してください".into();
@@ -312,7 +370,9 @@ fn standard_b64(bytes: &[u8]) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index + 3 <= bytes.len() {
-        let value = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8) | (bytes[index + 2] as u32);
+        let value = ((bytes[index] as u32) << 16)
+            | ((bytes[index + 1] as u32) << 8)
+            | (bytes[index + 2] as u32);
         out.push(TABLE[((value >> 18) & 63) as usize] as char);
         out.push(TABLE[((value >> 12) & 63) as usize] as char);
         out.push(TABLE[((value >> 6) & 63) as usize] as char);
@@ -342,7 +402,12 @@ mod tests {
 
     #[test]
     fn reads_token_mfa_and_captcha() {
-        let token = read_step(200, &json!({"token": "secret-token", "user_id": "1"}), false).unwrap();
+        let token = read_step(
+            200,
+            &json!({"token": "secret-token", "user_id": "1"}),
+            false,
+        )
+        .unwrap();
         assert!(matches!(token, AuthStep::Token(value) if value == "secret-token"));
         let mfa = read_step(
             200,
@@ -350,14 +415,23 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(matches!(mfa, AuthStep::Mfa { sms: true, backup: true, .. }));
+        assert!(matches!(
+            mfa,
+            AuthStep::Mfa {
+                sms: true,
+                backup: true,
+                ..
+            }
+        ));
         let captcha = read_step(
             400,
             &json!({"captcha_key": ["captcha-required"], "captcha_sitekey": "site", "captcha_service": "hcaptcha", "captcha_rqdata": "rq"}),
             false,
         )
         .unwrap();
-        assert!(matches!(captcha, AuthStep::Captcha(challenge) if challenge.sitekey == "site" && challenge.rqdata == "rq"));
+        assert!(
+            matches!(captcha, AuthStep::Captcha(challenge) if challenge.sitekey == "site" && challenge.rqdata == "rq")
+        );
     }
 
     #[test]

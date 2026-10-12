@@ -150,6 +150,7 @@ struct OutputSlot {
     fps: f64,
     width: u32,
     height: u32,
+    idle_video: Vec<u8>,
 }
 
 struct PreviewSlot {
@@ -161,11 +162,45 @@ struct PreviewSlot {
     at: Instant,
 }
 
+struct VideoRate {
+    window_start: Instant,
+    frames: u32,
+    fps: f64,
+}
+
+impl VideoRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            frames: 0,
+            fps: 30.0,
+        }
+    }
+
+    fn note(&mut self, now: Instant) -> (u32, u32) {
+        self.frames = self.frames.saturating_add(1);
+        let elapsed = now
+            .saturating_duration_since(self.window_start)
+            .as_secs_f64();
+        if elapsed >= 1.0 {
+            // The frame at `now` starts the next window, so do not count it in
+            // the interval that just ended.
+            let measured = self.frames.saturating_sub(1) as f64 / elapsed;
+            if (1.0..=120.0).contains(&measured) {
+                self.fps = measured;
+            }
+            self.frames = 1;
+            self.window_start = now;
+        }
+        (((self.fps * 1000.0).round() as u32).max(1), 1000)
+    }
+}
+
 pub struct SourceRouter {
     slots: Vec<OutputSlot>,
     names: HashMap<u64, String>,
     previews: Vec<PreviewSlot>,
-    black: Vec<u8>,
+    video_rates: HashMap<(u64, u64, SourceKind), VideoRate>,
     silence: Vec<i16>,
     playback: PlaybackEngine,
 }
@@ -176,7 +211,7 @@ impl SourceRouter {
             slots: Vec::new(),
             names: HashMap::new(),
             previews: Vec::new(),
-            black: vec![0; 640 * 360 * 4],
+            video_rates: HashMap::new(),
             silence: vec![0; 960 * 2],
             playback: PlaybackEngine::new(),
         };
@@ -225,7 +260,11 @@ impl SourceRouter {
             self.enqueue_mix(channel_id, user_id, pcm, channels);
             return;
         }
-        let feed = FeedKey { channel_id, user_id, kind };
+        let feed = FeedKey {
+            channel_id,
+            user_id,
+            kind,
+        };
         for index in self.indexes_for(feed) {
             let speaker = matches!(self.slots[index].outlet, Outlet::Speakers);
             let camera = self.slots[index].kind == SourceKind::Camera;
@@ -239,7 +278,9 @@ impl SourceRouter {
                 continue;
             }
             let result = match &mut self.slots[index].outlet {
-                Outlet::Network(publisher) => publisher.publish_audio(pcm, sample_rate, channels).map_err(|err| err.to_string()),
+                Outlet::Network(publisher) => publisher
+                    .publish_audio(pcm, sample_rate, channels)
+                    .map_err(|err| err.to_string()),
                 Outlet::Speakers => Ok(()),
             };
             if let Err(err) = result {
@@ -266,15 +307,33 @@ impl SourceRouter {
         }
         note_video_size(kind.slug(), width, height);
         self.remember_preview(user_id, kind, bgra, width, height);
-        let feed = FeedKey { channel_id, user_id, kind };
+        let feed = FeedKey {
+            channel_id,
+            user_id,
+            kind,
+        };
+        let now = Instant::now();
+        let frame_rate = self
+            .video_rates
+            .entry((channel_id, user_id, kind))
+            .or_insert_with(|| VideoRate::new(now))
+            .note(now);
         for index in self.indexes_for(feed) {
             if matches!(self.slots[index].outlet, Outlet::Speakers) {
                 continue;
             }
             self.slots[index].width = width;
             self.slots[index].height = height;
+            let idle_len = (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(4);
+            if self.slots[index].idle_video.len() != idle_len {
+                self.slots[index].idle_video.resize(idle_len, 0);
+            }
             let result = match &mut self.slots[index].outlet {
-                Outlet::Network(publisher) => publisher.publish_video(bgra, width, height, (30, 1)).map_err(|err| err.to_string()),
+                Outlet::Network(publisher) => publisher
+                    .publish_video(bgra, width, height, frame_rate)
+                    .map_err(|err| err.to_string()),
                 Outlet::Speakers => Ok(()),
             };
             if let Err(err) = result {
@@ -313,7 +372,16 @@ impl SourceRouter {
             return Err("同じ名前の出力があります".into());
         }
         let (channel_start, channel_count) = normalize_channels(channel_start, channel_count);
-        let outlet = open_outlet(&self.playback, &id, &name, kind, transport, &device, channel_start, channel_count)?;
+        let outlet = open_outlet(
+            &self.playback,
+            &id,
+            &name,
+            kind,
+            transport,
+            &device,
+            channel_start,
+            channel_count,
+        )?;
         let assignment = route_feed(kind, channel_id, user_id);
         tracing::info!(%name, kind = kind.slug(), transport = transport.slug(), "created output");
         self.slots.push(OutputSlot {
@@ -349,6 +417,7 @@ impl SourceRouter {
             fps: 0.0,
             width: 640,
             height: 360,
+            idle_video: vec![0; 640 * 360 * 4],
         });
         Ok(())
     }
@@ -397,7 +466,12 @@ impl SourceRouter {
                 continue;
             }
             let mut produced = 0;
-            while produced < 3 && self.slots[index].tracks.iter().any(|track| track.pending.len() >= FRAME) {
+            while produced < 3
+                && self.slots[index]
+                    .tracks
+                    .iter()
+                    .any(|track| track.pending.len() >= FRAME)
+            {
                 let pcm = mix_tracks(&mut self.slots[index].tracks, FRAME);
                 self.emit_pcm(index, &pcm);
                 produced += 1;
@@ -436,7 +510,9 @@ impl SourceRouter {
             return;
         }
         let result = match &mut self.slots[index].outlet {
-            Outlet::Network(publisher) => publisher.publish_audio(pcm, 48_000, 2).map_err(|err| err.to_string()),
+            Outlet::Network(publisher) => publisher
+                .publish_audio(pcm, 48_000, 2)
+                .map_err(|err| err.to_string()),
             Outlet::Speakers => Ok(()),
         };
         match result {
@@ -463,7 +539,11 @@ impl SourceRouter {
         if name.is_empty() {
             return Err("名前を入力してください".into());
         }
-        if self.slots.iter().any(|slot| slot.name == name && slot.id != id) {
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.name == name && slot.id != id)
+        {
             return Err("同じ名前の出力があります".into());
         }
         let Some(index) = self.slots.iter().position(|slot| slot.id == id) else {
@@ -492,7 +572,9 @@ impl SourceRouter {
             let slot = &mut self.slots[index];
             slot.outlet = outlet;
             slot.name = name;
-            slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+            slot.last_output = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now);
             return Ok(());
         }
         self.slots[index].name = name;
@@ -580,7 +662,8 @@ impl SourceRouter {
                     let _ = publisher.publish_audio(&self.silence, 48_000, 2);
                 }
                 if video {
-                    let _ = publisher.publish_video(&self.black, 640, 360, (1, 1));
+                    let _ =
+                        publisher.publish_video(&slot.idle_video, slot.width, slot.height, (1, 1));
                 }
             }
             slot.last_output = Instant::now();
@@ -611,7 +694,9 @@ impl SourceRouter {
                         .collect();
                     names.join("、")
                 } else {
-                    user_id.and_then(|id| self.names.get(&id).cloned()).unwrap_or_default()
+                    user_id
+                        .and_then(|id| self.names.get(&id).cloned())
+                        .unwrap_or_default()
                 };
                 let live = slot
                     .last_media
@@ -635,7 +720,8 @@ impl SourceRouter {
     }
 
     pub fn preview_frames(&mut self) -> Vec<PreviewFrame> {
-        self.previews.retain(|slot| slot.at.elapsed() < Duration::from_secs(5));
+        self.previews
+            .retain(|slot| slot.at.elapsed() < Duration::from_secs(5));
         self.previews
             .iter()
             .map(|slot| PreviewFrame {
@@ -654,8 +740,19 @@ impl SourceRouter {
             .collect()
     }
 
-    fn remember_preview(&mut self, user_id: u64, kind: SourceKind, bgra: &[u8], width: u32, height: u32) {
-        if let Some(slot) = self.previews.iter().find(|slot| slot.user_id == user_id && slot.kind == kind) {
+    fn remember_preview(
+        &mut self,
+        user_id: u64,
+        kind: SourceKind,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        if let Some(slot) = self
+            .previews
+            .iter()
+            .find(|slot| slot.user_id == user_id && slot.kind == kind)
+        {
             if slot.at.elapsed() < Duration::from_millis(200) {
                 return;
             }
@@ -664,7 +761,11 @@ impl SourceRouter {
         if rgba.is_empty() {
             return;
         }
-        if let Some(slot) = self.previews.iter_mut().find(|slot| slot.user_id == user_id && slot.kind == kind) {
+        if let Some(slot) = self
+            .previews
+            .iter_mut()
+            .find(|slot| slot.user_id == user_id && slot.kind == kind)
+        {
             slot.width = width;
             slot.height = height;
             slot.rgba = rgba;
@@ -686,20 +787,36 @@ impl SourceRouter {
         routed(&bindings, feed)
     }
 
-    fn reopen(&mut self, index: usize, kind: SourceKind, transport: Transport) -> Result<(), String> {
+    fn reopen(
+        &mut self,
+        index: usize,
+        kind: SourceKind,
+        transport: Transport,
+    ) -> Result<(), String> {
         let id = self.slots[index].id.clone();
         let name = self.slots[index].name.clone();
         let device = self.slots[index].device.clone();
         let channel_start = self.slots[index].channel_start;
         let channel_count = self.slots[index].channel_count;
         self.playback.unbind(&id);
-        let outlet = open_outlet(&self.playback, &id, &name, kind, transport, &device, channel_start, channel_count)?;
+        let outlet = open_outlet(
+            &self.playback,
+            &id,
+            &name,
+            kind,
+            transport,
+            &device,
+            channel_start,
+            channel_count,
+        )?;
         let slot = &mut self.slots[index];
         slot.kind = kind;
         slot.binding.kind = kind;
         slot.transport = transport;
         slot.outlet = outlet;
-        slot.last_output = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+        slot.last_output = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
         Ok(())
     }
 }
@@ -719,9 +836,14 @@ fn open_outlet(
     }
     if transport.is_speaker() {
         if transport == Transport::Asio && !egress::asio_available() {
-            return Err("ASIO は入っていません。ASIO SDK を入れて、asio 付きでビルドしてください".into());
+            return Err(
+                "ASIO は入っていません。ASIO SDK を入れて、asio 付きでビルドしてください".into(),
+            );
         }
-        playback.bind(id, speaker_target(transport, device, channel_start, channel_count))?;
+        playback.bind(
+            id,
+            speaker_target(transport, device, channel_start, channel_count),
+        )?;
         return Ok(Outlet::Speakers);
     }
     let (omt, ndi) = transport.flags();
@@ -741,7 +863,9 @@ fn speaker_target(transport: Transport, device: &str, start: u16, count: u16) ->
             count,
         }
     } else {
-        SpeakerTarget::Device { name: device.to_owned() }
+        SpeakerTarget::Device {
+            name: device.to_owned(),
+        }
     }
 }
 
@@ -814,7 +938,11 @@ fn route_feed(kind: SourceKind, channel_id: u64, user_id: u64) -> Option<FeedKey
     if channel_id == 0 || user_id == 0 {
         None
     } else {
-        Some(FeedKey { channel_id, user_id, kind })
+        Some(FeedKey {
+            channel_id,
+            user_id,
+            kind,
+        })
     }
 }
 
@@ -830,7 +958,11 @@ fn routed(slots: &[Binding], feed: FeedKey) -> Vec<usize> {
 #[cfg(test)]
 fn pin(slots: &mut [Binding], index: usize, channel_id: u64, user_id: u64) {
     let kind = slots[index].kind;
-    slots[index].assignment = Some(FeedKey { channel_id, user_id, kind });
+    slots[index].assignment = Some(FeedKey {
+        channel_id,
+        user_id,
+        kind,
+    });
     slots[index].pinned = true;
 }
 
@@ -870,8 +1002,15 @@ fn note_video_size(kind: &'static str, width: u32, height: u32) {
     tracing::info!(kind, width, height, "video frame");
 }
 
-fn downscale_bgra_to_rgba(bgra: &[u8], width: u32, height: u32, max_width: u32) -> (u32, u32, Vec<u8>) {
-    let pixels = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+fn downscale_bgra_to_rgba(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    max_width: u32,
+) -> (u32, u32, Vec<u8>) {
+    let pixels = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
     if width == 0 || height == 0 || bgra.len() < pixels {
         return (0, 0, Vec::new());
     }
@@ -922,13 +1061,21 @@ mod tests {
     use super::*;
 
     fn empty(kind: SourceKind) -> Binding {
-        Binding { kind, assignment: None, pinned: false }
+        Binding {
+            kind,
+            assignment: None,
+            pinned: false,
+        }
     }
 
     #[test]
     fn explicit_route_stays_when_the_feed_returns() {
         let mut slots = vec![empty(SourceKind::Camera), empty(SourceKind::Camera)];
-        let alice = FeedKey { channel_id: 7, user_id: 1, kind: SourceKind::Camera };
+        let alice = FeedKey {
+            channel_id: 7,
+            user_id: 1,
+            kind: SourceKind::Camera,
+        };
         pin(&mut slots, 0, 7, 1);
         assert_eq!(routed(&slots, alice), vec![0]);
         assert_eq!(routed(&slots, alice), vec![0]);
@@ -937,7 +1084,11 @@ mod tests {
     #[test]
     fn unrouted_feed_does_not_occupy_an_output() {
         let slots = vec![empty(SourceKind::Audio)];
-        let feed = FeedKey { channel_id: 1, user_id: 9, kind: SourceKind::Audio };
+        let feed = FeedKey {
+            channel_id: 1,
+            user_id: 9,
+            kind: SourceKind::Audio,
+        };
         assert!(routed(&slots, feed).is_empty());
     }
 
@@ -946,7 +1097,11 @@ mod tests {
         let mut slots = vec![empty(SourceKind::Camera), empty(SourceKind::Camera)];
         pin(&mut slots, 0, 7, 1);
         pin(&mut slots, 1, 7, 1);
-        let alice = FeedKey { channel_id: 7, user_id: 1, kind: SourceKind::Camera };
+        let alice = FeedKey {
+            channel_id: 7,
+            user_id: 1,
+            kind: SourceKind::Camera,
+        };
         assert_eq!(routed(&slots, alice), vec![0, 1]);
     }
 
@@ -960,12 +1115,39 @@ mod tests {
     }
 
     #[test]
+    fn video_rate_tracks_the_delivered_frame_cadence() {
+        let start = Instant::now();
+        let mut thirty = VideoRate::new(start);
+        thirty.note(start);
+        let mut rate = (0, 1);
+        for frame in 1..=30 {
+            rate = thirty.note(start + Duration::from_secs_f64(frame as f64 / 30.0));
+        }
+        assert_eq!(rate, (30_000, 1000));
+
+        let mut sixty = VideoRate::new(start);
+        sixty.note(start);
+        for frame in 1..=60 {
+            rate = sixty.note(start + Duration::from_secs_f64(frame as f64 / 60.0));
+        }
+        assert_eq!(rate, (60_000, 1000));
+    }
+
+    #[test]
     fn audio_output_ignores_a_camera_feed() {
         let mut slots = vec![empty(SourceKind::Audio)];
         pin(&mut slots, 0, 1, 4);
-        let camera = FeedKey { channel_id: 1, user_id: 4, kind: SourceKind::Camera };
+        let camera = FeedKey {
+            channel_id: 1,
+            user_id: 4,
+            kind: SourceKind::Camera,
+        };
         assert!(routed(&slots, camera).is_empty());
-        let audio = FeedKey { channel_id: 1, user_id: 4, kind: SourceKind::Audio };
+        let audio = FeedKey {
+            channel_id: 1,
+            user_id: 4,
+            kind: SourceKind::Audio,
+        };
         assert_eq!(routed(&slots, audio), vec![0]);
     }
 

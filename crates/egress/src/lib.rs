@@ -8,7 +8,9 @@ mod playback;
 pub use error::EgressError;
 pub use fanout::{FanoutPublisher, SourceMode};
 pub use frame::{color_bars, sine_tone};
-pub use playback::{asio_available, list_output_devices, ListedDevice, PlaybackEngine, SpeakerTarget};
+pub use playback::{
+    asio_available, list_output_devices, ListedDevice, PlaybackEngine, SpeakerTarget,
+};
 
 use std::time::Duration;
 
@@ -41,11 +43,10 @@ pub fn run_colorbar(
     duration: Duration,
 ) -> Result<(), EgressError> {
     if !enable_omt && !enable_ndi {
-        return Err(EgressError::InvalidFrame(
-            "enable OMT, NDI, or both",
-        ));
+        return Err(EgressError::InvalidFrame("enable OMT, NDI, or both"));
     }
-    let mut publisher = FanoutPublisher::open(name, SourceMode::AudioAndVideo, enable_omt, enable_ndi)?;
+    let mut publisher =
+        FanoutPublisher::open(name, SourceMode::AudioAndVideo, enable_omt, enable_ndi)?;
     let width = 1280u32;
     let height = 720u32;
     let fps = 30u32;

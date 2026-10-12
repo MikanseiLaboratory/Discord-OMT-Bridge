@@ -4,14 +4,17 @@ use std::time::{Duration, Instant};
 
 use discord_media::{spawn_media, ConnectParams, MediaEvent, MediaHandle, MediaKind, VideoPicture};
 use discord_user_gateway::{
-    spawn_gateway, ChannelRecord, GatewayCommand, GatewayEvent, GuildRecord, StreamEndpoint, VoiceEndpoint,
+    spawn_gateway, ChannelRecord, GatewayCommand, GatewayEvent, GuildRecord, StreamEndpoint,
+    VoiceEndpoint,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
 
 use crate::config::{Config, RuntimeSettings};
 use crate::router::{log_sources, SourceKind, SourceRouter, Transport};
-use crate::snapshot::{capture, ChannelState, GuildState, MemberState, PreviewFrame, SeatInput, Snapshot, UserState};
+use crate::snapshot::{
+    capture, ChannelState, GuildState, MemberState, PreviewFrame, SeatInput, Snapshot, UserState,
+};
 
 enum Bus {
     Gateway(GatewayEvent),
@@ -20,8 +23,14 @@ enum Bus {
 }
 
 pub enum ControlCommand {
-    Join { guild_id: u64, channel_id: u64 },
-    Leave { guild_id: u64, channel_id: u64 },
+    Join {
+        guild_id: u64,
+        channel_id: u64,
+    },
+    Leave {
+        guild_id: u64,
+        channel_id: u64,
+    },
     Assign {
         slot_id: String,
         channel_id: u64,
@@ -91,14 +100,26 @@ impl BridgeHandle {
     }
 
     pub fn join(&self, guild_id: u64, channel_id: u64) -> Result<(), String> {
-        self.send(ControlCommand::Join { guild_id, channel_id })
+        self.send(ControlCommand::Join {
+            guild_id,
+            channel_id,
+        })
     }
 
     pub fn leave_channel(&self, guild_id: u64, channel_id: u64) -> Result<(), String> {
-        self.send(ControlCommand::Leave { guild_id, channel_id })
+        self.send(ControlCommand::Leave {
+            guild_id,
+            channel_id,
+        })
     }
 
-    pub fn assign_slot(&self, slot_id: String, channel_id: u64, user_id: u64, kind: String) -> Result<(), String> {
+    pub fn assign_slot(
+        &self,
+        slot_id: String,
+        channel_id: u64,
+        user_id: u64,
+        kind: String,
+    ) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
         self.send(ControlCommand::Assign {
             slot_id,
@@ -156,7 +177,11 @@ impl BridgeHandle {
 
     pub fn set_transport(&self, id: String, transport: String) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
-        self.send(ControlCommand::SetTransport { id, transport, reply })?;
+        self.send(ControlCommand::SetTransport {
+            id,
+            transport,
+            reply,
+        })?;
         waiter
             .blocking_recv()
             .unwrap_or_else(|_| Err("アプリが止まっています".into()))
@@ -184,7 +209,13 @@ impl BridgeHandle {
             .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
-    pub fn set_playback(&self, id: String, device: String, channel_start: u16, channel_count: u16) -> Result<(), String> {
+    pub fn set_playback(
+        &self,
+        id: String,
+        device: String,
+        channel_start: u16,
+        channel_count: u16,
+    ) -> Result<(), String> {
         let (reply, waiter) = oneshot::channel();
         self.send(ControlCommand::SetPlayback {
             id,
@@ -242,8 +273,9 @@ struct Session {
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let token = std::env::var("DISCORD_TOKEN")
-        .map_err(|_| anyhow::anyhow!("環境変数 DISCORD_TOKEN にユーザートークンを設定してください"))?;
+    let token = std::env::var("DISCORD_TOKEN").map_err(|_| {
+        anyhow::anyhow!("環境変数 DISCORD_TOKEN にユーザートークンを設定してください")
+    })?;
     let initial_joins = config.channel_targets();
     if initial_joins.is_empty() {
         anyhow::bail!("guild_id と channel_id、または channels を設定してください");
@@ -555,20 +587,10 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
             }
             event = bus_rx.recv() => {
                 let Some(event) = event else { break };
-                let mut pending = vec![event];
-                let mut index = 0;
-                while index < pending.len() {
-                    if bus_is_video(&pending[index]) {
-                        while let Ok(next) = bus_rx.try_recv() {
-                            if bus_is_video(&next) {
-                                pending[index] = next;
-                            } else {
-                                pending.push(next);
-                                break;
-                            }
-                        }
-                    }
-                    index += 1;
+                let mut pending = Vec::new();
+                coalesce_bus_event(&mut pending, event);
+                while let Ok(next) = bus_rx.try_recv() {
+                    coalesce_bus_event(&mut pending, next);
                 }
                 for event in pending {
                 match event {
@@ -608,10 +630,12 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                             media.golive_misses.remove(&key);
                         }
                         let mut rewatch = false;
+                        let mut missing_video = false;
                         if let MediaEvent::Disconnected { reason } = &event {
                             world.last_error = Some(reason.clone());
                             rewatch = media.streams.remove(&key).is_some();
-                            if reason.contains("video did not arrive") {
+                            missing_video = reason.contains("video did not arrive");
+                            if missing_video {
                                 let misses = media.golive_misses.entry(key.clone()).or_insert(0);
                                 *misses = misses.saturating_add(1);
                             }
@@ -621,7 +645,9 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                                 .stream_retry
                                 .get(&key)
                                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
-                            if due {
+                            let misses = media.golive_misses.get(&key).copied().unwrap_or(0);
+                            // The 8s cooldown would skip the retry that this timeout just asked for.
+                            if due || (missing_video && misses <= 3) {
                                 media.stream_retry.insert(key.clone(), Instant::now());
                                 if let Some(endpoint) = media.stream_endpoints.get(&key).cloned() {
                                     if let Some(handle) = open_stream(&session.config, self_id, &media, endpoint, bus_tx.clone()) {
@@ -647,24 +673,84 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bus_is_video(event: &Bus) -> bool {
-    match event {
-        Bus::Voice { event: MediaEvent::Video { .. }, .. } | Bus::Stream { event: MediaEvent::Video { .. }, .. } => true,
+fn coalesce_bus_event(pending: &mut Vec<Bus>, next: Bus) {
+    if let Some(index) = pending
+        .iter()
+        .position(|current| same_video_source(current, &next))
+    {
+        pending[index] = next;
+    } else {
+        pending.push(next);
+    }
+}
+
+fn same_video_source(left: &Bus, right: &Bus) -> bool {
+    match (left, right) {
+        (
+            Bus::Voice {
+                channel_id: left_channel,
+                event:
+                    MediaEvent::Video {
+                        user_id: left_user, ..
+                    },
+            },
+            Bus::Voice {
+                channel_id: right_channel,
+                event:
+                    MediaEvent::Video {
+                        user_id: right_user,
+                        ..
+                    },
+            },
+        ) => left_channel == right_channel && left_user == right_user,
+        (
+            Bus::Stream {
+                key: left_key,
+                event:
+                    MediaEvent::Video {
+                        user_id: left_user, ..
+                    },
+            },
+            Bus::Stream {
+                key: right_key,
+                event:
+                    MediaEvent::Video {
+                        user_id: right_user,
+                        ..
+                    },
+            },
+        ) => left_key == right_key && left_user == right_user,
         _ => false,
     }
 }
 
-fn latest_video(events: &mut mpsc::Receiver<MediaEvent>, mut event: MediaEvent) -> (MediaEvent, Option<MediaEvent>) {
+fn latest_video(
+    events: &mut mpsc::Receiver<MediaEvent>,
+    mut event: MediaEvent,
+) -> (MediaEvent, Option<MediaEvent>) {
     if !matches!(event, MediaEvent::Video { .. }) {
         return (event, None);
     }
     loop {
         match events.try_recv() {
-            Ok(newer @ MediaEvent::Video { .. }) => event = newer,
+            Ok(newer @ MediaEvent::Video { .. }) if same_media_video(&event, &newer) => {
+                event = newer
+            }
+            Ok(other @ MediaEvent::Video { .. }) => return (event, Some(other)),
             Ok(other) => return (event, Some(other)),
             Err(_) => return (event, None),
         }
     }
+}
+
+fn same_media_video(left: &MediaEvent, right: &MediaEvent) -> bool {
+    matches!(
+        (left, right),
+        (
+            MediaEvent::Video { user_id: left, .. },
+            MediaEvent::Video { user_id: right, .. }
+        ) if left == right
+    )
 }
 
 fn consider_autojoin(world: &World, media: &mut MediaState) {
@@ -682,12 +768,18 @@ fn consider_autojoin(world: &World, media: &mut MediaState) {
     if guild_part.is_empty() || channel_part.is_empty() {
         return;
     }
-    let Some(guild) = world.guilds.iter().find(|guild| guild.name.contains(guild_part)) else {
+    let Some(guild) = world
+        .guilds
+        .iter()
+        .find(|guild| guild.name.contains(guild_part))
+    else {
         return;
     };
-    let Some(channel) = guild.channels.iter().find(|channel| {
-        channel.kind == "voice" && channel.name.eq_ignore_ascii_case(channel_part)
-    }) else {
+    let Some(channel) = guild
+        .channels
+        .iter()
+        .find(|channel| channel.kind == "voice" && channel.name.eq_ignore_ascii_case(channel_part))
+    else {
         return;
     };
     media.autojoined = true;
@@ -745,8 +837,11 @@ fn leave_seat(media: &mut MediaState, guild_id: u64, channel_id: u64) {
         .streams
         .keys()
         .filter(|key| {
-            discord_user_gateway::parse_stream_key(key)
-                .is_some_and(|(stream_guild, stream_channel, _)| stream_guild == guild_id && stream_channel == channel_id)
+            discord_user_gateway::parse_stream_key(key).is_some_and(
+                |(stream_guild, stream_channel, _)| {
+                    stream_guild == guild_id && stream_channel == channel_id
+                },
+            )
         })
         .cloned()
         .collect();
@@ -756,7 +851,10 @@ fn leave_seat(media: &mut MediaState, guild_id: u64, channel_id: u64) {
         }
     }
     if media.focused == Some(target) {
-        media.focused = media.seats.last().map(|seat| (seat.guild_id, seat.channel_id));
+        media.focused = media
+            .seats
+            .last()
+            .map(|seat| (seat.guild_id, seat.channel_id));
     }
 }
 
@@ -807,7 +905,11 @@ fn publish_mut(session: &Session, world: &World, media: &MediaState, router: &mu
         return;
     };
     let phase = if !world.ready {
-        if world.reconnecting { "reconnecting" } else { "connecting" }
+        if world.reconnecting {
+            "reconnecting"
+        } else {
+            "connecting"
+        }
     } else if world.reconnecting {
         "reconnecting"
     } else if !media.seats.is_empty() {
@@ -885,7 +987,9 @@ async fn watch_live(
         let stream_key = format!("guild:{guild_id}:{channel_id}:{}", member.user_id);
         if media.watched.insert(stream_key.clone()) {
             tracing::info!("watching Go Live");
-            commands.send(GatewayCommand::WatchStream { stream_key }).await?;
+            commands
+                .send(GatewayCommand::WatchStream { stream_key })
+                .await?;
         }
     }
     Ok(())
@@ -907,7 +1011,11 @@ async fn handle_gateway(
     self_id: &mut u64,
 ) -> anyhow::Result<()> {
     match event {
-        GatewayEvent::Ready { user_id, username, avatar } => {
+        GatewayEvent::Ready {
+            user_id,
+            username,
+            avatar,
+        } => {
             *self_id = user_id;
             world.ready = true;
             world.reconnecting = false;
@@ -944,19 +1052,28 @@ async fn handle_gateway(
         }
         GatewayEvent::GuildRemoved { guild_id } => {
             world.guilds.retain(|guild| guild.id != guild_id);
-            world.members.retain(|_, member| member.guild_id != Some(guild_id));
+            world
+                .members
+                .retain(|_, member| member.guild_id != Some(guild_id));
         }
         GatewayEvent::ChannelUpsert { guild_id, channel } => {
             upsert_channel(&mut world.guilds, guild_id, channel);
             consider_autojoin(world, media);
             pump_joins(world, media, commands, config).await?;
         }
-        GatewayEvent::ChannelRemoved { guild_id, channel_id } => {
+        GatewayEvent::ChannelRemoved {
+            guild_id,
+            channel_id,
+        } => {
             if let Some(guild) = world.guilds.iter_mut().find(|guild| guild.id == guild_id) {
                 guild.channels.retain(|channel| channel.id != channel_id);
             }
         }
-        GatewayEvent::Profile { user_id, name, avatar } => {
+        GatewayEvent::Profile {
+            user_id,
+            name,
+            avatar,
+        } => {
             if let Some(member) = world.members.get_mut(&user_id) {
                 if placeholder_name(&member.name) {
                     member.name = name.clone();
@@ -970,7 +1087,11 @@ async fn handle_gateway(
         GatewayEvent::VoiceMember(member) => {
             let name = if !member.display_name.is_empty() {
                 member.display_name.clone()
-            } else if let Some(existing) = world.members.get(&member.user_id).filter(|existing| !placeholder_name(&existing.name)) {
+            } else if let Some(existing) = world
+                .members
+                .get(&member.user_id)
+                .filter(|existing| !placeholder_name(&existing.name))
+            {
                 existing.name.clone()
             } else if member.user_id == *self_id {
                 world
@@ -1005,7 +1126,9 @@ async fn handle_gateway(
             }
             if let (Some(guild_id), Some(channel_id)) = (member.guild_id, member.channel_id) {
                 if !member.self_stream {
-                    media.watched.remove(&format!("guild:{guild_id}:{channel_id}:{}", member.user_id));
+                    media
+                        .watched
+                        .remove(&format!("guild:{guild_id}:{channel_id}:{}", member.user_id));
                 }
             }
             watch_live(commands, world, media, config, *self_id).await?;
@@ -1015,34 +1138,47 @@ async fn handle_gateway(
             watch_live(commands, world, media, config, *self_id).await?;
             pump_joins(world, media, commands, config).await?;
         }
-        GatewayEvent::StreamAnnounced { stream_key, user_id, paused } => {
-            if paused || !config.allows(user_id) {
-                return Ok(());
-            }
-            commands.send(GatewayCommand::WatchStream { stream_key }).await?;
-        }
+        // STREAM_CREATE confirms a WatchStream request. Sending WatchStream
+        // again here can create a duplicate stream-server session.
+        GatewayEvent::StreamAnnounced { .. } => {}
         GatewayEvent::StreamAvailable(endpoint) => {
             if endpoint.paused || !config.allows(endpoint.user_id) {
                 return Ok(());
             }
-            media.stream_endpoints.insert(endpoint.stream_key.clone(), endpoint.clone());
+            media
+                .stream_endpoints
+                .insert(endpoint.stream_key.clone(), endpoint.clone());
             if media.streams.contains_key(&endpoint.stream_key) {
                 return Ok(());
             }
-            let Some((guild_id, channel_id, _)) = discord_user_gateway::parse_stream_key(&endpoint.stream_key) else {
+            let Some((guild_id, channel_id, _)) =
+                discord_user_gateway::parse_stream_key(&endpoint.stream_key)
+            else {
                 return Ok(());
             };
             let Some(session_id) = media
                 .seats
                 .iter()
-                .find(|seat| seat.guild_id == guild_id && seat.channel_id == channel_id && !seat.session_id.is_empty())
+                .find(|seat| {
+                    seat.guild_id == guild_id
+                        && seat.channel_id == channel_id
+                        && !seat.session_id.is_empty()
+                })
                 .map(|seat| seat.session_id.clone())
             else {
                 tracing::warn!(stream_key = %endpoint.stream_key, "Go Live を見るボイスに、まだ入っていません");
                 return Ok(());
             };
             let key = endpoint.stream_key.clone();
-            let handle = start_stream(config, *self_id, channel_id, &session_id, endpoint, bus_tx.clone(), golive_should_restart(media, &key));
+            let handle = start_stream(
+                config,
+                *self_id,
+                channel_id,
+                &session_id,
+                endpoint,
+                bus_tx.clone(),
+                golive_should_restart(media, &key),
+            );
             media.streams.insert(key, handle);
         }
         GatewayEvent::StreamUpdated { stream_key, paused } => {
@@ -1069,7 +1205,11 @@ async fn handle_gateway(
             world.ready = false;
             media.awaiting = None;
             media.discard_until = None;
-            let pending: Vec<(u64, u64)> = media.seats.iter().map(|seat| (seat.guild_id, seat.channel_id)).collect();
+            let pending: Vec<(u64, u64)> = media
+                .seats
+                .iter()
+                .map(|seat| (seat.guild_id, seat.channel_id))
+                .collect();
             for seat in &mut media.seats {
                 seat.connected = false;
                 if let Some(handle) = seat.voice.take() {
@@ -1116,7 +1256,9 @@ fn attach_voice(
         }
         return Ok(());
     };
-    let same_session = seat.voice.is_some() && seat.session_id == endpoint.session_id && seat.voice_endpoint == endpoint.endpoint;
+    let same_session = seat.voice.is_some()
+        && seat.session_id == endpoint.session_id
+        && seat.voice_endpoint == endpoint.endpoint;
     if same_session {
         tracing::info!("voice session is already connected");
     } else {
@@ -1127,7 +1269,13 @@ fn attach_voice(
         seat.session_id = endpoint.session_id.clone();
         seat.voice_endpoint = endpoint.endpoint.clone();
         seat.connected = true;
-        seat.voice = Some(start_voice(config, self_id, channel_id, endpoint, bus_tx.clone()));
+        seat.voice = Some(start_voice(
+            config,
+            self_id,
+            channel_id,
+            endpoint,
+            bus_tx.clone(),
+        ));
     }
     if matches_awaiting {
         media.awaiting = None;
@@ -1136,7 +1284,9 @@ fn attach_voice(
 }
 
 fn upsert_guild(guilds: &mut Vec<GuildState>, record: GuildRecord) {
-    let channels = record.channels.map(|list| list.into_iter().map(channel_state).collect::<Vec<_>>());
+    let channels = record
+        .channels
+        .map(|list| list.into_iter().map(channel_state).collect::<Vec<_>>());
     if let Some(existing) = guilds.iter_mut().find(|guild| guild.id == record.id) {
         existing.name = record.name;
         existing.icon = record.icon;
@@ -1189,6 +1339,7 @@ fn start_voice(
         server_id: endpoint.server_id,
         user_id: self_id,
         channel_id,
+        rtc_channel_id: 0,
         kind: MediaKind::Voice,
         max_video_slots: config.max_video_slots,
         prefer_quality: 100,
@@ -1208,10 +1359,22 @@ fn open_stream(
     let session_id = media
         .seats
         .iter()
-        .find(|seat| seat.guild_id == guild_id && seat.channel_id == channel_id && !seat.session_id.is_empty())
+        .find(|seat| {
+            seat.guild_id == guild_id
+                && seat.channel_id == channel_id
+                && !seat.session_id.is_empty()
+        })
         .map(|seat| seat.session_id.clone())?;
     let restart = golive_should_restart(media, &endpoint.stream_key);
-    Some(start_stream(config, self_id, channel_id, &session_id, endpoint, bus_tx, restart))
+    Some(start_stream(
+        config,
+        self_id,
+        channel_id,
+        &session_id,
+        endpoint,
+        bus_tx,
+        restart,
+    ))
 }
 
 fn golive_should_restart(media: &MediaState, key: &str) -> bool {
@@ -1235,12 +1398,18 @@ fn start_stream(
         server_id: endpoint.rtc_server_id,
         user_id: self_id,
         channel_id,
+        rtc_channel_id: endpoint.rtc_channel_id,
         kind: MediaKind::GoLive,
         max_video_slots: config.max_video_slots,
         prefer_quality: 100,
         restart_if_video_missing,
     });
-    tracing::info!(stream_key = %key, user_id = endpoint.user_id, "watching Go Live");
+    tracing::info!(
+        stream_key = %key,
+        user_id = endpoint.user_id,
+        has_rtc_channel = endpoint.rtc_channel_id > 0,
+        "watching Go Live"
+    );
     forward_media(handle, bus_tx, VoiceRoute::Stream(key))
 }
 
@@ -1279,32 +1448,8 @@ fn forward_media(handle: MediaHandle, bus_tx: mpsc::Sender<Bus>, route: VoiceRou
                     }
                 }
             };
-            let (mut event, next) = latest_video(&mut events, event);
+            let (event, next) = latest_video(&mut events, event);
             deferred = next;
-            if matches!(event, MediaEvent::Video { .. }) {
-                event = newest_picture(event, &mut pictures);
-                // Do not queue a second full frame while the bridge is still
-                // publishing. The watch already holds the newest one.
-                while bus_tx.max_capacity().saturating_sub(bus_tx.capacity()) > 8 {
-                    tokio::select! {
-                        _ = task_cancel.cancelled() => return,
-                        changed = pictures.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            if let Some(picture) = pictures.borrow_and_update().clone() {
-                                event = picture_event(picture);
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                            if bus_tx.max_capacity().saturating_sub(bus_tx.capacity()) <= 8 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                event = newest_picture(event, &mut pictures);
-            }
             let message = match &route {
                 VoiceRoute::Channel(channel_id) => Bus::Voice {
                     channel_id: *channel_id,
@@ -1325,18 +1470,6 @@ fn forward_media(handle: MediaHandle, bus_tx: mpsc::Sender<Bus>, route: VoiceRou
         pictures: idle_pictures(),
         cancel,
     }
-}
-
-fn newest_picture(event: MediaEvent, pictures: &mut watch::Receiver<Option<VideoPicture>>) -> MediaEvent {
-    if !matches!(event, MediaEvent::Video { .. }) {
-        return event;
-    }
-    if pictures.has_changed().unwrap_or(false) {
-        if let Some(picture) = pictures.borrow_and_update().clone() {
-            return picture_event(picture);
-        }
-    }
-    event
 }
 
 fn picture_event(picture: VideoPicture) -> MediaEvent {
@@ -1374,18 +1507,36 @@ fn apply_media(
     event: &MediaEvent,
 ) {
     match event {
-        MediaEvent::Audio { user_id, pcm, sample_rate, channels } if *user_id != self_id => {
+        MediaEvent::Audio {
+            user_id,
+            pcm,
+            sample_rate,
+            channels,
+        } if *user_id != self_id => {
             let source = if kind == MediaKind::Voice {
                 SourceKind::Audio
             } else {
                 SourceKind::GoLive
             };
-            router.publish_audio(config, channel_id, *user_id, source, pcm, *sample_rate, *channels);
+            router.publish_audio(
+                config,
+                channel_id,
+                *user_id,
+                source,
+                pcm,
+                *sample_rate,
+                *channels,
+            );
             if kind == MediaKind::Voice {
                 note_voice_pcm(channel_id, *user_id, pcm.len());
             }
         }
-        MediaEvent::Video { user_id, bgra, width, height } if *user_id != self_id => {
+        MediaEvent::Video {
+            user_id,
+            bgra,
+            width,
+            height,
+        } if *user_id != self_id => {
             let source = if kind == MediaKind::Voice {
                 SourceKind::Camera
             } else {

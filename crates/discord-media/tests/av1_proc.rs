@@ -1,4 +1,6 @@
-use discord_media::{maybe_run_av1_worker, Av1IpcError, Av1Supervisor, FLAG_ABORT, FLAG_BAD_ID, FLAG_HANG};
+use discord_media::{
+    maybe_run_av1_worker, Av1IpcError, Av1Supervisor, FLAG_ABORT, FLAG_BAD_ID, FLAG_HANG,
+};
 
 fn main() {
     if maybe_run_av1_worker() {
@@ -14,7 +16,9 @@ fn main() {
 
 fn parent_survives_abort() {
     let mut worker = Av1Supervisor::spawn_with(std::time::Duration::from_secs(2)).expect("worker");
-    let err = worker.decode_flags(1, &[0x0a], FLAG_ABORT).expect_err("abort");
+    let err = worker
+        .decode_flags(1, &[0x0a], FLAG_ABORT)
+        .expect_err("abort");
     eprintln!("abort contained: {err}");
     worker.decode(1, &[]).expect("worker restarted after abort");
 }
@@ -29,14 +33,20 @@ fn parent_keeps_separate_streams() {
 
 fn parent_rejects_a_bad_response() {
     let mut worker = Av1Supervisor::spawn_with(std::time::Duration::from_secs(2)).expect("worker");
-    let err = worker.decode_flags(1, &[], FLAG_BAD_ID).expect_err("bad id");
+    let err = worker
+        .decode_flags(1, &[], FLAG_BAD_ID)
+        .expect_err("bad id");
     eprintln!("bad response contained: {err}");
-    worker.decode(1, &[]).expect("worker restarted after a bad response");
+    worker
+        .decode(1, &[])
+        .expect("worker restarted after a bad response");
 }
 
 fn parent_refuses_a_delta_before_a_sequence_header() {
     let mut worker = Av1Supervisor::spawn_with(std::time::Duration::from_secs(2)).expect("worker");
-    let err = worker.decode(1, &[0x30, 0xd1, 0x7b, 0x7e]).expect_err("delta without a sequence header");
+    let err = worker
+        .decode(1, &[0x30, 0xd1, 0x7b, 0x7e])
+        .expect_err("delta without a sequence header");
     match err {
         Av1IpcError::Decode(text) => assert!(text.contains("sequence header"), "{text}"),
         other => panic!("worker aborted instead of refusing the frame: {other}"),
@@ -45,10 +55,16 @@ fn parent_refuses_a_delta_before_a_sequence_header() {
 }
 
 fn parent_survives_a_hang() {
-    let mut worker = Av1Supervisor::spawn_with(std::time::Duration::from_millis(400)).expect("worker");
+    let mut worker =
+        Av1Supervisor::spawn_with(std::time::Duration::from_millis(400)).expect("worker");
     let started = std::time::Instant::now();
     let err = worker.decode_flags(1, &[], FLAG_HANG).expect_err("hang");
-    assert!(started.elapsed() < std::time::Duration::from_secs(3), "hang was not killed");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "hang was not killed"
+    );
     eprintln!("hang contained: {err}");
-    worker.decode(1, &[]).expect("worker restarted after a hang");
+    worker
+        .decode(1, &[])
+        .expect("worker restarted after a hang");
 }

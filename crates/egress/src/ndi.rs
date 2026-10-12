@@ -12,13 +12,14 @@ mod imp {
     }
 
     impl NdiPublisher {
-        pub fn open(name: &str) -> Result<Self, EgressError> {
+        pub fn open(name: &str, video: bool, audio: bool) -> Result<Self, EgressError> {
             let ndi = NDI::new().map_err(|err| EgressError::Ndi(err.to_string()))?;
             let options = SenderOptions::builder(name)
-                .clock_video(false)
-                .clock_audio(false)
+                .clock_video(video)
+                .clock_audio(audio)
                 .build();
-            let sender = Sender::new(&ndi, &options).map_err(|err| EgressError::Ndi(err.to_string()))?;
+            let sender =
+                Sender::new(&ndi, &options).map_err(|err| EgressError::Ndi(err.to_string()))?;
             tracing::info!(name, "NDI source published");
             Ok(Self { sender, _ndi: ndi })
         }
@@ -65,7 +66,10 @@ mod imp {
                 return Err(EgressError::InvalidFrame("invalid PCM layout"));
             }
             let samples = (pcm.len() / channels as usize) as u32;
-            let data: Vec<f32> = pcm.iter().map(|sample| *sample as f32 / i16::MAX as f32).collect();
+            let data: Vec<f32> = pcm
+                .iter()
+                .map(|sample| *sample as f32 / i16::MAX as f32)
+                .collect();
             let frame = AudioFrame::builder()
                 .sample_rate(ndi_i32(sample_rate)?)
                 .channels(ndi_i32(u32::from(channels))?)
@@ -79,7 +83,8 @@ mod imp {
     }
 
     fn ndi_i32(value: u32) -> Result<i32, EgressError> {
-        i32::try_from(value).map_err(|_| EgressError::InvalidFrame("value does not fit an NDI frame"))
+        i32::try_from(value)
+            .map_err(|_| EgressError::InvalidFrame("value does not fit an NDI frame"))
     }
 }
 
@@ -90,7 +95,7 @@ mod imp {
     pub struct NdiPublisher;
 
     impl NdiPublisher {
-        pub fn open(_name: &str) -> Result<Self, EgressError> {
+        pub fn open(_name: &str, _video: bool, _audio: bool) -> Result<Self, EgressError> {
             Err(EgressError::Ndi(
                 "rebuild with the `ndi` feature and an installed NDI 6 SDK".into(),
             ))

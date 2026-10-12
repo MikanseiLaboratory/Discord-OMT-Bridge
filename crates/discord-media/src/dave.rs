@@ -61,7 +61,11 @@ impl DaveState {
             .map_err(|err| MediaError::Dave(err.to_string()))
     }
 
-    pub fn proposals(&mut self, operation: u8, proposals: &[u8]) -> Result<Option<davey::CommitWelcome>, MediaError> {
+    pub fn proposals(
+        &mut self,
+        operation: u8,
+        proposals: &[u8],
+    ) -> Result<Option<davey::CommitWelcome>, MediaError> {
         let operation = match operation {
             0 => ProposalsOperationType::APPEND,
             1 => ProposalsOperationType::REVOKE,
@@ -99,8 +103,15 @@ impl DaveState {
         self.session.set_passthrough_mode(true, Some(10));
     }
 
-    pub fn decrypt(&mut self, user_id: u64, video: bool, packet: &[u8]) -> Result<Vec<u8>, MediaError> {
-        if self.protocol_version == 0 || self.session.can_passthrough(user_id) && !self.session.is_ready() {
+    pub fn decrypt(
+        &mut self,
+        user_id: u64,
+        video: bool,
+        packet: &[u8],
+    ) -> Result<Vec<u8>, MediaError> {
+        if self.protocol_version == 0
+            || self.session.can_passthrough(user_id) && !self.session.is_ready()
+        {
             return Ok(packet.to_vec());
         }
         let media = if video {

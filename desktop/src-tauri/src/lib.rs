@@ -4,8 +4,9 @@ use std::sync::Mutex;
 mod logs;
 
 use discord_omt_bridge::{
-    default_settings_path, list_output_devices, login_password, send_login_sms, spawn_session, submit_mfa, AuthStep,
-    AudioSource, BridgeHandle, CaptchaAnswer, OutputRoute, PreviewFrame, Settings, Snapshot, SourceKind, Transport,
+    default_settings_path, list_output_devices, login_password, send_login_sms, spawn_session,
+    submit_mfa, AudioSource, AuthStep, BridgeHandle, CaptchaAnswer, OutputRoute, PreviewFrame,
+    Settings, Snapshot, SourceKind, Transport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindowBuilder};
@@ -89,8 +90,16 @@ fn to_dto(settings: &Settings, path: &PathBuf) -> SettingsDto {
     SettingsDto {
         token: settings.token.clone(),
         self_deaf: settings.self_deaf,
-        allow_user_ids: settings.allow_user_ids.iter().map(|id| id.to_string()).collect(),
-        deny_user_ids: settings.deny_user_ids.iter().map(|id| id.to_string()).collect(),
+        allow_user_ids: settings
+            .allow_user_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect(),
+        deny_user_ids: settings
+            .deny_user_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect(),
         max_video_slots: settings.max_video_slots as u32,
         idle_timeout_secs: settings.idle_timeout_secs,
         client_build_number: settings.client_build_number,
@@ -140,7 +149,9 @@ fn parse_route_id(value: &str) -> Result<u64, String> {
     if value.is_empty() || value == "0" {
         return Ok(0);
     }
-    value.parse::<u64>().map_err(|_| format!("ID が不正です: {value}"))
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("ID が不正です: {value}"))
 }
 
 fn outputs_from_dto(values: &[OutputDto]) -> Result<Vec<OutputRoute>, String> {
@@ -156,7 +167,10 @@ fn outputs_from_dto(values: &[OutputDto]) -> Result<Vec<OutputRoute>, String> {
         }
         let kind = SourceKind::parse(&output.kind)?.slug().to_owned();
         let transport = Transport::parse(&output.transport)?.slug().to_owned();
-        if outputs.iter().any(|existing: &OutputRoute| existing.id == id || existing.name == name) {
+        if outputs
+            .iter()
+            .any(|existing: &OutputRoute| existing.id == id || existing.name == name)
+        {
             return Err("同じ名前の出力があります".into());
         }
         outputs.push(OutputRoute {
@@ -183,7 +197,9 @@ fn members_from_dto(values: &[AudioMemberDto]) -> Result<Vec<AudioSource>, Strin
         if channel_id == 0 || user_id == 0 {
             continue;
         }
-        if members.iter().any(|existing: &AudioSource| existing.channel_id == channel_id && existing.user_id == user_id) {
+        if members.iter().any(|existing: &AudioSource| {
+            existing.channel_id == channel_id && existing.user_id == user_id
+        }) {
             continue;
         }
         members.push(AudioSource {
@@ -230,7 +246,9 @@ fn load_settings(state: State<'_, AppState>) -> Result<SettingsDto, String> {
 fn save_settings(state: State<'_, AppState>, settings: SettingsDto) -> Result<(), String> {
     let settings = from_dto(&settings)?;
     settings.to_config().map_err(|err| err.to_string())?;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())?;
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())?;
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.apply(settings.runtime())?;
     }
@@ -257,9 +275,17 @@ fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn join_voice(state: State<'_, AppState>, guild_id: String, channel_id: String) -> Result<(), String> {
-    let guild_id = guild_id.parse::<u64>().map_err(|_| "サーバー ID が不正です".to_owned())?;
-    let channel_id = channel_id.parse::<u64>().map_err(|_| "チャンネル ID が不正です".to_owned())?;
+fn join_voice(
+    state: State<'_, AppState>,
+    guild_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    let guild_id = guild_id
+        .parse::<u64>()
+        .map_err(|_| "サーバー ID が不正です".to_owned())?;
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|_| "チャンネル ID が不正です".to_owned())?;
     let guard = state.bridge.lock().expect("bridge lock");
     let Some(handle) = guard.as_ref() else {
         return Err("先に接続してください".into());
@@ -268,9 +294,17 @@ fn join_voice(state: State<'_, AppState>, guild_id: String, channel_id: String) 
 }
 
 #[tauri::command]
-fn leave_voice(state: State<'_, AppState>, guild_id: String, channel_id: String) -> Result<(), String> {
-    let guild_id = guild_id.parse::<u64>().map_err(|_| "サーバー ID が不正です".to_owned())?;
-    let channel_id = channel_id.parse::<u64>().map_err(|_| "チャンネル ID が不正です".to_owned())?;
+fn leave_voice(
+    state: State<'_, AppState>,
+    guild_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    let guild_id = guild_id
+        .parse::<u64>()
+        .map_err(|_| "サーバー ID が不正です".to_owned())?;
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|_| "チャンネル ID が不正です".to_owned())?;
     let guard = state.bridge.lock().expect("bridge lock");
     let Some(handle) = guard.as_ref() else {
         return Err("接続していません".into());
@@ -285,8 +319,12 @@ fn assign_slot(
     channel_id: String,
     user_id: String,
 ) -> Result<(), String> {
-    let channel_id = channel_id.parse::<u64>().map_err(|_| "チャンネル ID が不正です".to_owned())?;
-    let user_id = user_id.parse::<u64>().map_err(|_| "ユーザー ID が不正です".to_owned())?;
+    let channel_id = channel_id
+        .parse::<u64>()
+        .map_err(|_| "チャンネル ID が不正です".to_owned())?;
+    let user_id = user_id
+        .parse::<u64>()
+        .map_err(|_| "ユーザー ID が不正です".to_owned())?;
     let guard = state.bridge.lock().expect("bridge lock");
     let Some(handle) = guard.as_ref() else {
         return Err("先に接続してください".into());
@@ -304,7 +342,12 @@ fn clear_slot(state: State<'_, AppState>, slot_id: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn add_output(state: State<'_, AppState>, name: String, kind: String, transport: String) -> Result<String, String> {
+fn add_output(
+    state: State<'_, AppState>,
+    name: String,
+    kind: String,
+    transport: String,
+) -> Result<String, String> {
     let name = name.trim().to_owned();
     if name.is_empty() {
         return Err("名前を入力してください".into());
@@ -323,7 +366,15 @@ fn add_output(state: State<'_, AppState>, name: String, kind: String, transport:
     }
     let id = new_output_id(&settings.outputs);
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
-        if let Err(err) = handle.add_output(id.clone(), name.clone(), kind.clone(), transport.clone(), String::new(), 1, 2) {
+        if let Err(err) = handle.add_output(
+            id.clone(),
+            name.clone(),
+            kind.clone(),
+            transport.clone(),
+            String::new(),
+            1,
+            2,
+        ) {
             return Err(err);
         }
     }
@@ -358,20 +409,34 @@ fn remove_output(state: State<'_, AppState>, output_id: String) -> Result<(), St
         handle.remove_output(output_id.clone())?;
     }
     settings.outputs.retain(|output| output.id != output_id);
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn rename_output(state: State<'_, AppState>, output_id: String, name: String) -> Result<(), String> {
+fn rename_output(
+    state: State<'_, AppState>,
+    output_id: String,
+    name: String,
+) -> Result<(), String> {
     let name = name.trim().to_owned();
     if name.is_empty() {
         return Err("名前を入力してください".into());
     }
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    if settings.outputs.iter().any(|output| output.name == name && output.id != output_id) {
+    if settings
+        .outputs
+        .iter()
+        .any(|output| output.name == name && output.id != output_id)
+    {
         return Err("同じ名前の出力があります".into());
     }
-    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+    let Some(index) = settings
+        .outputs
+        .iter()
+        .position(|output| output.id == output_id)
+    else {
         return Err("出力が見つかりません".into());
     };
     if settings.outputs[index].name == name {
@@ -381,7 +446,9 @@ fn rename_output(state: State<'_, AppState>, output_id: String, name: String) ->
         handle.rename_output(output_id, name.clone())?;
     }
     settings.outputs[index].name = name;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -400,7 +467,11 @@ fn set_output_route(
         SourceKind::parse(&kind)?.slug().to_owned()
     };
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+    let Some(index) = settings
+        .outputs
+        .iter()
+        .position(|output| output.id == output_id)
+    else {
         return Err("出力が見つかりません".into());
     };
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
@@ -420,27 +491,40 @@ fn set_output_route(
         settings.outputs[index].channel_id = channel_id;
         settings.outputs[index].user_id = user_id;
     }
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn set_output_transport(state: State<'_, AppState>, output_id: String, transport: String) -> Result<(), String> {
+fn set_output_transport(
+    state: State<'_, AppState>,
+    output_id: String,
+    transport: String,
+) -> Result<(), String> {
     let transport = Transport::parse(&transport)?.slug().to_owned();
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+    let Some(index) = settings
+        .outputs
+        .iter()
+        .position(|output| output.id == output_id)
+    else {
         return Err("出力が見つかりません".into());
     };
     if settings.outputs[index].transport == transport {
         return Ok(());
     }
-    if video_kind(&settings.outputs[index].kind) && matches!(transport.as_str(), "device" | "asio") {
+    if video_kind(&settings.outputs[index].kind) && matches!(transport.as_str(), "device" | "asio")
+    {
         return Err("映像は OMT か NDI に出します".into());
     }
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.set_transport(output_id, transport.clone())?;
     }
     settings.outputs[index].transport = transport;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -455,7 +539,11 @@ fn set_output_playback(
     let channel_start = channel_start.max(1);
     let channel_count = channel_count.clamp(1, 64);
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+    let Some(index) = settings
+        .outputs
+        .iter()
+        .position(|output| output.id == output_id)
+    else {
         return Err("出力が見つかりません".into());
     };
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
@@ -464,7 +552,9 @@ fn set_output_playback(
     settings.outputs[index].device = device;
     settings.outputs[index].channel_start = channel_start;
     settings.outputs[index].channel_count = channel_count;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -480,7 +570,11 @@ fn set_audio_member(
     let user_id = parse_route_id(&user_id)?;
     let volume = volume.min(200);
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
-    let Some(index) = settings.outputs.iter().position(|output| output.id == output_id) else {
+    let Some(index) = settings
+        .outputs
+        .iter()
+        .position(|output| output.id == output_id)
+    else {
         return Err("出力が見つかりません".into());
     };
     if settings.outputs[index].kind != "audio" {
@@ -492,9 +586,15 @@ fn set_audio_member(
     let members = &mut settings.outputs[index].members;
     members.retain(|member| !(member.channel_id == channel_id && member.user_id == user_id));
     if included && channel_id != 0 && user_id != 0 {
-        members.push(AudioSource { channel_id, user_id, volume });
+        members.push(AudioSource {
+            channel_id,
+            user_id,
+            volume,
+        });
     }
-    settings.save(&state.settings_path).map_err(|err| err.to_string())
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())
 }
 
 #[derive(Serialize)]
@@ -526,7 +626,9 @@ fn set_voice_flags(state: State<'_, AppState>, self_deaf: bool) -> Result<(), St
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
     settings.self_deaf = self_deaf;
     settings.to_config().map_err(|err| err.to_string())?;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())?;
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())?;
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.apply(settings.runtime())?;
     }
@@ -549,7 +651,11 @@ struct AuthDto {
     session_id: String,
 }
 
-fn captcha_answer(key: Option<String>, rqtoken: Option<String>, session_id: Option<String>) -> Option<CaptchaAnswer> {
+fn captcha_answer(
+    key: Option<String>,
+    rqtoken: Option<String>,
+    session_id: Option<String>,
+) -> Option<CaptchaAnswer> {
     let key = key.unwrap_or_default();
     if key.trim().is_empty() {
         return None;
@@ -589,7 +695,12 @@ fn auth_dto(step: AuthStep) -> AuthDto {
             dto.kind = "token".into();
             dto.token = token;
         }
-        AuthStep::Mfa { ticket, totp, sms, backup } => {
+        AuthStep::Mfa {
+            ticket,
+            totp,
+            sms,
+            backup,
+        } => {
             dto.kind = "mfa".into();
             dto.ticket = ticket;
             dto.totp = totp;
@@ -777,11 +888,16 @@ async fn open_discord_login(app: tauri::AppHandle) -> Result<(), String> {
         let _ = tx.send(result);
     })
     .map_err(|err| err.to_string())?;
-    rx.recv().map_err(|_| "ログイン画面を開けませんでした".to_owned())?
+    rx.recv()
+        .map_err(|_| "ログイン画面を開けませんでした".to_owned())?
 }
 
 #[tauri::command]
-fn complete_discord_login(app: tauri::AppHandle, state: State<'_, AppState>, token: String) -> Result<(), String> {
+fn complete_discord_login(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), String> {
     let token = token.trim().trim_matches('"').trim().to_owned();
     if token.len() < 50 || token.chars().any(char::is_whitespace) {
         return Err("ログイン結果を読み取れませんでした".into());
@@ -789,7 +905,9 @@ fn complete_discord_login(app: tauri::AppHandle, state: State<'_, AppState>, tok
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
     settings.token = token;
     settings.to_config().map_err(|err| err.to_string())?;
-    settings.save(&state.settings_path).map_err(|err| err.to_string())?;
+    settings
+        .save(&state.settings_path)
+        .map_err(|err| err.to_string())?;
     app.emit("discord-login-finished", ())
         .map_err(|err| err.to_string())?;
     let closer = app.clone();

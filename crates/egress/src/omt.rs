@@ -38,7 +38,8 @@ impl OmtPublisher {
                 ))
             }
         };
-        let sender = Sender::create(name, frame_types).map_err(|err| EgressError::Omt(err.to_string()))?;
+        let sender =
+            Sender::create(name, frame_types).map_err(|err| EgressError::Omt(err.to_string()))?;
         let port = sender.port();
         let audio_ingress = sender.audio_ingress();
         let mut discovery = Discovery::new().map_err(|err| EgressError::Omt(err.to_string()))?;
@@ -111,7 +112,9 @@ impl VideoPublisher for OmtPublisher {
             .saturating_mul(height as usize)
             .saturating_mul(4);
         if bgra.len() < expected || width == 0 || height == 0 {
-            return Err(EgressError::InvalidFrame("BGRA buffer does not match dimensions"));
+            return Err(EgressError::InvalidFrame(
+                "BGRA buffer does not match dimensions",
+            ));
         }
         let subscribed = self
             .sender
@@ -121,7 +124,9 @@ impl VideoPublisher for OmtPublisher {
         if !subscribed {
             return Ok(());
         }
-        let bitstream = self.video_encoder.encode(&bgra[..expected], width, height)?;
+        let bitstream = self
+            .video_encoder
+            .encode(&bgra[..expected], width, height)?;
         let frame = MediaFrame {
             frame_type: VIDEO,
             codec: Codec::Vmx1.as_i32(),
@@ -159,7 +164,9 @@ impl AudioPublisher for OmtPublisher {
         }
         let channels_usize = channels as usize;
         if pcm.len() % channels_usize != 0 {
-            return Err(EgressError::InvalidFrame("PCM length is not a multiple of channels"));
+            return Err(EgressError::InvalidFrame(
+                "PCM length is not a multiple of channels",
+            ));
         }
         let samples = pcm.len() / channels_usize;
         let planar = interleaved_i16_to_planar_f32(pcm, channels_usize);
@@ -213,6 +220,7 @@ struct HqEncoder {
     codec: Option<vmx::Codec>,
     width: i32,
     height: i32,
+    quality: i32,
     buf: Vec<u8>,
 }
 
@@ -222,6 +230,7 @@ impl HqEncoder {
             codec: None,
             width: 0,
             height: 0,
+            quality: 80,
             buf: Vec::new(),
         }
     }
@@ -230,7 +239,9 @@ impl HqEncoder {
         let width = width as i32;
         let height = height as i32;
         if width < 16 || height < 16 {
-            return Err(EgressError::InvalidFrame("video frame is smaller than 16 pixels"));
+            return Err(EgressError::InvalidFrame(
+                "video frame is smaller than 16 pixels",
+            ));
         }
         if self.codec.is_none() || self.width != width || self.height != height {
             self.codec = Some(
@@ -244,13 +255,26 @@ impl HqEncoder {
             );
             self.width = width;
             self.height = height;
-            tracing::info!(width, height, "OMT video encoder is using the high-quality profile");
+            self.quality = 80;
+            tracing::info!(
+                width,
+                height,
+                "OMT video encoder is using the high-quality profile"
+            );
         }
         let codec = self.codec.as_mut().expect("codec after create");
+        // vmx1 0.1.0 confuses the quality-index maximum (24) with the
+        // user-facing quality scale (0..=99) in its adaptive controller.
+        // Set the corrected value before every frame and calculate the next
+        // value on the public 0..=99 scale after encoding.
+        codec.set_quality(self.quality);
         codec
             .encode_bgrx(bgra, (width as usize).saturating_mul(4))
             .map_err(|err| EgressError::Omt(err.to_string()))?;
-        let need = (width as usize).saturating_mul(height as usize).saturating_mul(2).max(1 << 20);
+        let need = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(2)
+            .max(1 << 20);
         if self.buf.len() < need {
             self.buf.resize(need, 0);
         }
@@ -264,7 +288,11 @@ impl HqEncoder {
                     self.buf.resize(need, 0);
                 }
                 Err(vmx::VmxError::BufferOverflow) => {
-                    let next = self.buf.len().saturating_mul(2).max(self.buf.len().saturating_add(1 << 20));
+                    let next = self
+                        .buf
+                        .len()
+                        .saturating_mul(2)
+                        .max(self.buf.len().saturating_add(1 << 20));
                     if next <= self.buf.len() || next > 256 << 20 {
                         return Err(EgressError::Omt("VMX output buffer could not grow".into()));
                     }
@@ -273,7 +301,50 @@ impl HqEncoder {
                 Err(err) => return Err(EgressError::Omt(err.to_string())),
             }
         };
+        let (target_min, target_max, min_quality, _) = codec.encoding_parameters();
+        self.quality = next_vmx_quality(
+            self.quality,
+            min_quality,
+            written as i32,
+            target_min,
+            target_max,
+        );
         Ok(self.buf[..written].to_vec())
+    }
+}
+
+fn next_vmx_quality(
+    current: i32,
+    minimum: i32,
+    frame_len: i32,
+    target_min: i32,
+    target_max: i32,
+) -> i32 {
+    if frame_len <= 0 || target_min <= 0 || target_max <= 0 {
+        return current.clamp(minimum, 99);
+    }
+    if frame_len < target_min {
+        if current < minimum {
+            minimum
+        } else if current < 76 {
+            (current + 4).min(99)
+        } else if current < 92 {
+            (current + 2).min(99)
+        } else if current < 99 {
+            current + 1
+        } else {
+            current
+        }
+    } else if frame_len > target_max {
+        if current > 92 {
+            (current - 1).max(minimum)
+        } else if current > minimum {
+            (current - 2).max(minimum)
+        } else {
+            minimum
+        }
+    } else {
+        current.clamp(minimum, 99)
     }
 }
 
@@ -297,4 +368,17 @@ fn interleaved_i16_to_planar_f32(pcm: &[i16], channels: usize) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_vmx_quality;
+
+    #[test]
+    fn vmx_quality_stays_on_the_public_scale() {
+        assert_eq!(next_vmx_quality(80, 80, 100, 200, 300), 82);
+        assert_eq!(next_vmx_quality(98, 80, 100, 200, 300), 99);
+        assert_eq!(next_vmx_quality(99, 80, 400, 200, 300), 98);
+        assert_eq!(next_vmx_quality(80, 80, 400, 200, 300), 80);
+    }
 }
