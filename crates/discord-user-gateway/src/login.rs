@@ -302,9 +302,9 @@ fn failure_message(status: u16, body: &Value) -> String {
         return "メールアドレスまたはパスワードが違います".into();
     }
     if blob.contains("ACCOUNT_LOGIN_VERIFICATION") || blob.contains("verify") {
-        return "Discord がメールでの本人確認を求めています。メールを確認してからもう一度ログインしてください".into();
+        return "メールで本人確認が必要です。確認してから、もう一度ログインしてください".into();
     }
-    "ログインできませんでした。入力を確認して、もう一度試してください".into()
+    "ログインできませんでした。入力を見直して、もう一度試してください".into()
 }
 
 fn standard_b64(bytes: &[u8]) -> String {

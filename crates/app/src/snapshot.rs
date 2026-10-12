@@ -180,7 +180,7 @@ pub fn capture(
                         .map(|member| MemberView {
                             id: member.user_id.to_string(),
                             name: if member.name.is_empty() {
-                                "取得中".into()
+                                "読み込み中".into()
                             } else {
                                 member.name.clone()
                             },

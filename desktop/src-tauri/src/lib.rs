@@ -312,7 +312,7 @@ fn add_output(state: State<'_, AppState>, name: String, kind: String, transport:
     let kind = SourceKind::parse(&kind)?.slug().to_owned();
     let transport = Transport::parse(&transport)?.slug().to_owned();
     if video_kind(&kind) && matches!(transport.as_str(), "device" | "asio") {
-        return Err("映像の出し先は OMT か NDI です".into());
+        return Err("映像は OMT か NDI に出します".into());
     }
     let mut settings = Settings::load(&state.settings_path).map_err(|err| err.to_string())?;
     if settings.outputs.len() >= 64 {
@@ -434,7 +434,7 @@ fn set_output_transport(state: State<'_, AppState>, output_id: String, transport
         return Ok(());
     }
     if video_kind(&settings.outputs[index].kind) && matches!(transport.as_str(), "device" | "asio") {
-        return Err("映像の出し先は OMT か NDI です".into());
+        return Err("映像は OMT か NDI に出します".into());
     }
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.set_transport(output_id, transport.clone())?;
@@ -484,7 +484,7 @@ fn set_audio_member(
         return Err("出力が見つかりません".into());
     };
     if settings.outputs[index].kind != "audio" {
-        return Err("人の割り当ては音声出力だけです".into());
+        return Err("人を混ぜられるのは音声だけです".into());
     }
     if let Some(handle) = state.bridge.lock().expect("bridge lock").as_ref() {
         handle.set_audio_member(output_id, channel_id, user_id, volume, included)?;

@@ -35,7 +35,7 @@ impl SourceKind {
             "audio" | "Audio" => Ok(Self::Audio),
             "camera" | "Camera" => Ok(Self::Camera),
             "golive" | "GoLive" => Ok(Self::GoLive),
-            _ => Err("種類は音声、カメラ、Go Live のいずれかです".into()),
+            _ => Err("種類は音声、カメラ、Go Live です".into()),
         }
     }
 
@@ -72,7 +72,7 @@ impl Transport {
             "ndi" | "NDI" => Ok(Self::Ndi),
             "device" | "wasapi" => Ok(Self::Device),
             "asio" | "ASIO" => Ok(Self::Asio),
-            _ => Err("送出先は OMT、NDI、再生デバイス、ASIO のいずれかです".into()),
+            _ => Err("出力先は OMT、NDI、再生デバイス、ASIO です".into()),
         }
     }
 
@@ -365,7 +365,7 @@ impl SourceRouter {
             return Err("出力が見つかりません".into());
         };
         if slot.kind != SourceKind::Audio {
-            return Err("人の割り当ては音声出力だけです".into());
+            return Err("人を混ぜられるのは音声だけです".into());
         }
         if !included || channel_id == 0 || user_id == 0 {
             slot.tracks
@@ -645,7 +645,7 @@ impl SourceRouter {
                     .get(&slot.user_id)
                     .cloned()
                     .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "取得中".into()),
+                    .unwrap_or_else(|| "読み込み中".into()),
                 kind: slot.kind.slug().to_owned(),
                 width: slot.width,
                 height: slot.height,
@@ -715,18 +715,18 @@ fn open_outlet(
     channel_count: u16,
 ) -> Result<Outlet, String> {
     if matches!(kind, SourceKind::Camera | SourceKind::GoLive) && transport.is_speaker() {
-        return Err("映像の出し先は OMT か NDI です".into());
+        return Err("映像は OMT か NDI に出します".into());
     }
     if transport.is_speaker() {
         if transport == Transport::Asio && !egress::asio_available() {
-            return Err("このビルドには ASIO が含まれていません。ASIO SDK を入れて asio 機能付きでビルドしてください".into());
+            return Err("ASIO は入っていません。ASIO SDK を入れて、asio 付きでビルドしてください".into());
         }
         playback.bind(id, speaker_target(transport, device, channel_start, channel_count))?;
         return Ok(Outlet::Speakers);
     }
     let (omt, ndi) = transport.flags();
     if ndi && !cfg!(feature = "ndi") {
-        return Err("NDI を使うには NDI 6 SDK を入れ、ndi 機能付きでビルドしてください".into());
+        return Err("NDI を使うには、NDI 6 SDK を入れて ndi 付きでビルドしてください".into());
     }
     FanoutPublisher::open(name, kind.mode(), omt, ndi)
         .map(Outlet::Network)

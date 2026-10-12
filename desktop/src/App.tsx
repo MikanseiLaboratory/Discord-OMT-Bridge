@@ -100,7 +100,7 @@ function Matrix({
   }, []);
   return (
     <div className="matrix">
-      <p className="hint">音声と映像は別の出力です。音声は複数人を混ぜて、人ごとに音量を変えられます。映像は1人のカメラか Go Live で、出し先は OMT か NDI です。Go Live の音声は、その映像の OMT に乗せて送れます。</p>
+      <p className="hint">音声は人を混ぜて、音量を個別に変えられます。映像はカメラか Go Live を1本、OMT か NDI に出します。Go Live の音は、その映像の OMT に乗ります。</p>
       <div className="matrix-add">
         <input
           type="text"
@@ -142,7 +142,7 @@ function Matrix({
         </button>
       </div>
       {outputs.length === 0 ? (
-        <div className="empty">出力はまだありません。名前と出し先を決めて追加すると、その名前で送出されます。</div>
+        <div className="empty">まだ出力がありません。</div>
       ) : (
         <div className="matrix-list">
           {outputs.map((output) => (
@@ -250,7 +250,7 @@ function OutputCard({
       <TransportSelect snapshot={snapshot} audio={audio} value={transport} onChange={(value) => void onTransport(output.id, value)} />
       {transport === "device" || transport === "asio" ? (
         <select aria-label="再生デバイス" value={output.device || ""} onChange={(event) => void playback(event.target.value, output.channel_start || 1, output.channel_count || 2)}>
-          {transport === "device" ? <option value="">既定の再生デバイス</option> : <option value="">ASIO デバイスを選択</option>}
+          {transport === "device" ? <option value="">既定の再生デバイス</option> : <option value="">ASIO を選ぶ</option>}
           {output.device && !choices.some((device) => device.name === output.device) ? <option value={output.device}>{output.device}</option> : null}
           {choices.map((device) => (
             <option key={`${device.host}:${device.name}`} value={device.name}>
@@ -329,7 +329,7 @@ function OutputCard({
           </select>
         </>
       ) : (
-        <select aria-label="入力" value={current} onChange={(event) => void onRoute(output.id, event.target.value)}>
+        <select aria-label="映像" value={current} onChange={(event) => void onRoute(output.id, event.target.value)}>
           {videoInputs(snapshot, output).map((option) => (
             <option key={option.value || "none"} value={option.value}>
               {option.label}
@@ -338,7 +338,7 @@ function OutputCard({
         </select>
       )}
       <div className="meta">
-        {transportLabel(transport)} · {audio ? (members.length ? `${members.length}人` : "入力なし") : current ? kindLabel(output.kind) : "入力なし"} · {outputStatus(snapshot, output)}
+        {transportLabel(transport)} · {audio ? (members.length ? `${members.length}人` : "未設定") : current ? kindLabel(output.kind) : "未設定"} · {outputStatus(snapshot, output)}
       </div>
       <button className="secondary" type="button" onClick={() => void onRemove(output)}>
         削除
@@ -384,8 +384,8 @@ function Gate({
           <>
             <p className="lede">
               {auth.method === "sms"
-                ? "届いた SMS のコードを入力してください。"
-                : "認証アプリの6桁、またはバックアップコードを入力してください。"}
+                ? "届いた SMS のコードを入れてください。"
+                : "認証アプリの6桁か、バックアップコードを入れてください。"}
             </p>
             {message ? <div className="banner">{message}</div> : null}
             <label className="field">
@@ -408,13 +408,13 @@ function Gate({
           </>
         ) : (
           <>
-            <p className="lede">ログインは Discord の画面で一度だけ行います。確認と二段階認証もそこで完了し、終わるとこのアプリに戻ります。パスワードは保存しません。</p>
+            <p className="lede">Discord の画面でログインします。終わるとここに戻ります。パスワードは残りません。</p>
             {message ? <div className="banner">{message}</div> : null}
             <button className="primary" type="submit">
               ログイン
             </button>
             <details>
-              <summary>保存済みのトークンで接続</summary>
+              <summary>保存したトークンで接続</summary>
               <label className="field">
                 トークン
                 <input type="password" autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)} />
@@ -425,7 +425,7 @@ function Gate({
             </details>
           </>
         )}
-        <div className="warning">ユーザートークンで参加する方式は Discord の利用規約に反し、アカウント停止の対象です。自分の専用アカウント以外では使わないでください。</div>
+        <div className="warning">ユーザートークンでの接続は Discord の利用規約に反し、アカウント停止の対象です。自分用のアカウントだけにしてください。</div>
       </form>
     </div>
   );
@@ -466,10 +466,10 @@ function SettingsScreen({
           アカウント
         </button>
         <button type="button" className={tab === "voice" ? "active" : ""} onClick={() => setTab("voice")}>
-          ボイスと送出
+          ボイスと出力
         </button>
         <button type="button" className={tab === "limits" ? "active" : ""} onClick={() => setTab("limits")}>
-          ユーザー制限
+          出す人
         </button>
       </nav>
       <div className="settings-body">
@@ -478,10 +478,10 @@ function SettingsScreen({
         </button>
         <section className="settings-card" hidden={tab !== "account"}>
           <h2>アカウント</h2>
-          <p className="hint">最初の画面でメールアドレスとパスワード、必要なら二段階認証でログインします。パスワードは保存しません。ここにあるのは、そのあとこの端末に残したトークンです。</p>
-          <div className="warning">トークンはパスワードと同じです。{draft.path || ""} にだけ保存し、ログには出しません。</div>
+          <p className="hint">パスワードは残りません。ここに残るのは、この端末のトークンです。</p>
+          <div className="warning">トークンはパスワードと同じです。{draft.path || ""} だけに保存し、ログには出しません。</div>
           <label className="field">
-            保存済みトークン
+            保存したトークン
             <input
               type="password"
               autoComplete="off"
@@ -493,7 +493,7 @@ function SettingsScreen({
             />
           </label>
           <label className="field">
-            クライアント build number
+            ビルド番号
             <input
               type="number"
               min={0}
@@ -503,7 +503,7 @@ function SettingsScreen({
                 setDraft({ ...draft, client_build_number: Number(event.target.value || 0) });
               }}
             />
-            <span className="hint">0 のときは起動時に安定版の番号を取ります。変更は再接続後に使われます。</span>
+            <span className="hint">0 なら、起動時に安定版の番号を使います。変更はつなぎ直すと反映されます。</span>
           </label>
           <div className="actions">
             <button className="primary" type="button" onClick={() => void onConnect(collected()).catch(() => {})}>
@@ -515,16 +515,16 @@ function SettingsScreen({
           </div>
         </section>
         <section className="settings-card" hidden={tab !== "voice"}>
-          <h2>ボイスと送出</h2>
+          <h2>ボイスと出力</h2>
           <p className="hint">
-            マイクは常にミュートです。スピーカーミュートはホームのボタンです。映像は最高画質で受信し、告知された Go Live は制限なく視聴します。
+            マイクは常にミュートです。
             {snapshot.ndi_available
-              ? "映像の出し先は OMT か NDI です。音声はそれに加えて再生デバイスと ASIO も選べます。"
-              : "このビルドには NDI が含まれていません。NDI 6 SDK を入れて起動し直してください。"}
-            {snapshot.asio_available ? "" : " ASIO は、Steinberg ASIO SDK を入れて asio 機能付きでビルドしたときだけ選べます。"}
+              ? "映像は OMT か NDI、音声は再生デバイスと ASIO も選べます。"
+              : "NDI は入っていません。NDI 6 SDK を入れて、起動し直してください。"}
+            {snapshot.asio_available ? "" : " ASIO は、Steinberg ASIO SDK を入れて asio 付きでビルドしたときだけ選べます。"}
           </p>
           <label className="field">
-            映像の受信スロット
+            同時に受ける映像の数
             <input
               type="number"
               min={1}
@@ -537,7 +537,7 @@ function SettingsScreen({
             />
           </label>
           <label className="field">
-            無通信で待機表示にする秒数
+            途切れてから待機にする秒数
             <input
               type="number"
               min={1}
@@ -547,12 +547,12 @@ function SettingsScreen({
                 setDraft({ ...draft, idle_timeout_secs: Number(event.target.value || 5) });
               }}
             />
-            <span className="hint">受信が止まっても出力は閉じません。この秒数を過ぎると「待機」になります。受信スロット数は、次に接続したときから使われます。</span>
+            <span className="hint">受信が止まっても出力は閉じません。この秒数を過ぎると待機になります。映像の数は、つなぎ直すと変わります。</span>
           </label>
         </section>
         <section className="settings-card" hidden={tab !== "limits"}>
-          <h2>ソースに出すユーザー</h2>
-          <p className="hint">許可が空なら、拒否以外の全員を出します。ID は 1 行に 1 つです。</p>
+          <h2>出す人</h2>
+          <p className="hint">許可が空なら、拒否した人以外は出します。ID は1行に1人です。</p>
           <label className="field">
             許可
             <textarea
@@ -723,7 +723,7 @@ export default function App() {
   };
 
   const removeOutput = async (output: Output) => {
-    if (!confirm(`「${output.name || "この出力"}」を削除します。LAN 上のソースも閉じます。`)) return;
+    if (!confirm(`「${output.name || "この出力"}」を削除します。LAN への出力も止まります。`)) return;
     await invoke("remove_output", { outputId: output.id });
     await refreshSettings();
   };
@@ -750,7 +750,7 @@ export default function App() {
   const openDiscordLogin = async () => {
     setAuth(emptyAuth());
     await invoke("open_discord_login");
-    setGateMessage("Discord のログイン画面を開きました。ログインが終わると、この画面に戻って接続します。");
+    setGateMessage("Discord のログイン画面を開きました。終わるとここに戻ります。");
     setMode("gate");
   };
 
@@ -787,7 +787,7 @@ export default function App() {
     }
     if (step.kind === "sms") {
       setAuth((current) => ({ ...current, screen: "mfa", method: "sms", phone: step.phone || "" }));
-      setGateMessage(step.phone ? `SMS を ${step.phone} に送りました。` : "SMS を送りました。届いたコードを入力してください。");
+      setGateMessage(step.phone ? `SMS を ${step.phone} に送りました。` : "SMS を送りました。届いたコードを入れてください。");
       setMode("gate");
     }
   };
@@ -875,7 +875,7 @@ export default function App() {
         <div className="gate-card">
           <h1>Discord OMT Bridge</h1>
           <p className="lede">
-            この画面はデスクトップアプリの中で開きます。<code>npm run tauri dev</code> で起動してください。
+            ブラウザでは動きません。<code>npm run tauri dev</code> で起動してください。
           </p>
         </div>
       </div>
@@ -1125,10 +1125,10 @@ function ChannelColumn({
 }) {
   const user = snapshot.self_user;
   const online = snapshot.phase === "online" || snapshot.phase === "voice";
-  let body: React.ReactNode = <div className="empty">サーバーを選ぶとチャンネルが表示されます。</div>;
+  let body: React.ReactNode = <div className="empty">サーバーを選ぶと、チャンネルが出ます。</div>;
   if (guild) {
     if (!guild.channels.length && snapshot.phase === "connecting") {
-      body = <div className="empty">チャンネルを受信しています。</div>;
+      body = <div className="empty">チャンネルを読み込んでいます。</div>;
     } else {
       body = channelTree(guild.channels).map((section) => (
         <div key={section.category?.id || "loose"}>
@@ -1277,7 +1277,7 @@ function ReceivedVideo({ showEmpty = false }: { showEmpty?: boolean }) {
     };
   }, []);
   if (frames.length === 0) {
-    return showEmpty ? <p className="hint">受信した映像はまだありません。</p> : null;
+    return showEmpty ? <p className="hint">まだ映像はありません。</p> : null;
   }
   return (
     <div className="previews">
@@ -1340,7 +1340,7 @@ function MainColumn({
         <div className="home-body">
           <h2>Discord OMT Bridge</h2>
           <p>
-            左のサーバーからボイスチャンネルを選ぶと、その通話が席に追加されます。複数のチャンネルへ同時に参加できます。出力を追加し、名前と入力にする人を決めると、その人の音声や映像が OMT / NDI に流れます。カメラや Go Live を切っても出力は残ります。テキストは送受信しません。
+            左のサーバーからボイスチャンネルを選ぶと、その通話に参加します。複数のチャンネルに同時に入れます。出力に人を割り当てると、音声や映像が OMT / NDI に出ます。カメラや Go Live を切っても出力は残ります。テキストは扱いません。
           </p>
           <p>状態: {phaseLabel(snapshot.phase)}</p>
           {snapshot.phase === "disconnected" ? (
@@ -1349,11 +1349,11 @@ function MainColumn({
                 接続
               </button>
               <button className="secondary" type="button" onClick={onOpenSettings}>
-                トークンと設定
+                設定
               </button>
             </div>
           ) : null}
-          <h2>受信した映像</h2>
+          <h2>映像</h2>
           <ReceivedVideo />
           <h2>出力</h2>
           {matrix}
@@ -1365,7 +1365,7 @@ function MainColumn({
     return (
       <main className="main">
         <div className="pane-header">{guild.name}</div>
-        <div className="empty">チャンネルを選択してください。未参加のボイスチャンネルを選ぶと、その通話が席に追加されます。</div>
+        <div className="empty">チャンネルを選んでください。ボイスチャンネルを選ぶと、その通話に参加します。</div>
       </main>
     );
   }
@@ -1376,7 +1376,7 @@ function MainColumn({
         <div className="pane-header">
           {icon} {channel.name}
         </div>
-        <div className="empty">このアプリはテキストチャンネルの読み書きをしません。映像と音声はボイスチャンネルから受けます。</div>
+        <div className="empty">テキストは扱いません。音声と映像はボイスチャンネルから受けます。</div>
       </main>
     );
   }
@@ -1386,7 +1386,7 @@ function MainColumn({
         {icon} {channel.name}
       </div>
       <div className="stage">
-        <h2>受信した映像</h2>
+        <h2>映像</h2>
         <ReceivedVideo showEmpty />
         <div className="tiles">
           {(channel.members || []).length ? (
@@ -1409,7 +1409,7 @@ function MainColumn({
               );
             })
           ) : (
-            <div className="empty">このチャンネルには、まだ誰も表示されていません。</div>
+            <div className="empty">まだ誰もいません。</div>
           )}
         </div>
       </div>

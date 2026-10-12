@@ -109,7 +109,7 @@ impl BridgeHandle {
         })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn clear_slot(&self, slot_id: String) -> Result<(), String> {
@@ -117,7 +117,7 @@ impl BridgeHandle {
         self.send(ControlCommand::Clear { slot_id, reply })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn add_output(
@@ -143,7 +143,7 @@ impl BridgeHandle {
         })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn remove_output(&self, id: String) -> Result<(), String> {
@@ -151,7 +151,7 @@ impl BridgeHandle {
         self.send(ControlCommand::RemoveOutput { id, reply })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn set_transport(&self, id: String, transport: String) -> Result<(), String> {
@@ -159,7 +159,7 @@ impl BridgeHandle {
         self.send(ControlCommand::SetTransport { id, transport, reply })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn set_audio_member(
@@ -181,7 +181,7 @@ impl BridgeHandle {
         })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn set_playback(&self, id: String, device: String, channel_start: u16, channel_count: u16) -> Result<(), String> {
@@ -195,7 +195,7 @@ impl BridgeHandle {
         })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn rename_output(&self, id: String, name: String) -> Result<(), String> {
@@ -203,7 +203,7 @@ impl BridgeHandle {
         self.send(ControlCommand::RenameOutput { id, name, reply })?;
         waiter
             .blocking_recv()
-            .unwrap_or_else(|_| Err("ブリッジは停止しています".into()))
+            .unwrap_or_else(|_| Err("アプリが止まっています".into()))
     }
 
     pub fn previews(&self) -> Vec<PreviewFrame> {
@@ -229,7 +229,7 @@ impl BridgeHandle {
     fn send(&self, command: ControlCommand) -> Result<(), String> {
         self.control
             .blocking_send(command)
-            .map_err(|_| "ブリッジは停止しています".to_owned())
+            .map_err(|_| "アプリが止まっています".to_owned())
     }
 }
 
@@ -893,7 +893,7 @@ async fn watch_live(
 
 fn placeholder_name(name: &str) -> bool {
     let name = name.trim();
-    name.is_empty() || name == "取得中" || name.starts_with("user-")
+    name.is_empty() || name == "読み込み中" || name == "取得中" || name.starts_with("user-")
 }
 
 async fn handle_gateway(
@@ -978,9 +978,9 @@ async fn handle_gateway(
                     .as_ref()
                     .map(|user| user.name.clone())
                     .filter(|name| !placeholder_name(name))
-                    .unwrap_or_else(|| "取得中".into())
+                    .unwrap_or_else(|| "読み込み中".into())
             } else {
-                "取得中".into()
+                "読み込み中".into()
             };
             if member.channel_id.is_none() {
                 world.members.remove(&member.user_id);
@@ -1038,7 +1038,7 @@ async fn handle_gateway(
                 .find(|seat| seat.guild_id == guild_id && seat.channel_id == channel_id && !seat.session_id.is_empty())
                 .map(|seat| seat.session_id.clone())
             else {
-                tracing::warn!(stream_key = %endpoint.stream_key, "Go Live を見る親ボイスがまだありません");
+                tracing::warn!(stream_key = %endpoint.stream_key, "Go Live を見るボイスに、まだ入っていません");
                 return Ok(());
             };
             let key = endpoint.stream_key.clone();

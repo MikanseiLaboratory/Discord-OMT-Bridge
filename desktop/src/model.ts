@@ -134,7 +134,7 @@ export function phaseLabel(phase: string) {
     case "online":
       return "オンライン";
     case "voice":
-      return "ボイス接続";
+      return "通話中";
     case "reconnecting":
       return "再接続しています";
     default:
@@ -245,7 +245,7 @@ export function videoInputs(snapshot: Snapshot, output: Output) {
   const current = routeOf(output);
   if (current && !seen.has(current) && !isAudioOutput(output)) {
     const slot = snapshot.slots.find((item) => item.id === output.id);
-    const who = slot && slot.assigned_name && slot.assigned_name !== "取得中" ? slot.assigned_name : "取得中";
+    const who = slot && slot.assigned_name && slot.assigned_name !== "読み込み中" && slot.assigned_name !== "取得中" ? slot.assigned_name : "読み込み中";
     options.push({ value: current, label: `${who} の${kindLabel(output.kind)}` });
   }
   return options;

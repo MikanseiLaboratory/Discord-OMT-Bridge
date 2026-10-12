@@ -202,11 +202,11 @@ impl Worker {
         #[cfg(not(all(windows, feature = "asio")))]
         {
             let _ = (id, name, start, count);
-            return Err("このビルドには ASIO が含まれていません".into());
+            return Err("ASIO は入っていません".into());
         }
         #[cfg(all(windows, feature = "asio"))]
         {
-            let host = asio_host().ok_or_else(|| "ASIO ホストを開けません。ASIO SDK 付きでビルドしてください".to_owned())?;
+            let host = asio_host().ok_or_else(|| "ASIO を開けません。ASIO SDK 付きでビルドしてください".to_owned())?;
             let device = output_device(&host, name)?;
             let resolved = device.name().map_err(|err| err.to_string())?;
             let (config, format) = stream_config(&device, 0)?;
