@@ -297,13 +297,19 @@ fn yuv_to_bgra(yuv: &impl YUVSource) -> Vec<u8> {
     let y_plane = yuv.y();
     let u_plane = yuv.u();
     let v_plane = yuv.v();
+    let cw = (width / 2).max(1);
+    let ch = (height / 2).max(1);
     let mut bgra = vec![0u8; width * height * 4];
     for row in 0..height {
         for col in 0..width {
             let y = y_plane.get(row * y_stride + col).copied().unwrap_or(0) as i32;
-            let u = u_plane.get((row / 2) * u_stride + (col / 2)).copied().unwrap_or(128) as i32;
-            let v = v_plane.get((row / 2) * v_stride + (col / 2)).copied().unwrap_or(128) as i32;
-            let (b, g, r) = yuv_to_rgb(y, u, v);
+            let u = chroma_bilinear(col, row, 1, 1, cw, ch, |x, y| {
+                u_plane.get(y * u_stride + x).copied().unwrap_or(128) as i32
+            });
+            let v = chroma_bilinear(col, row, 1, 1, cw, ch, |x, y| {
+                v_plane.get(y * v_stride + x).copied().unwrap_or(128) as i32
+            });
+            let (b, g, r) = yuv709_to_rgb(y, u, v);
             let offset = (row * width + col) * 4;
             bgra[offset] = b;
             bgra[offset + 1] = g;
@@ -314,14 +320,45 @@ fn yuv_to_bgra(yuv: &impl YUVSource) -> Vec<u8> {
     bgra
 }
 
-fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
+/// BT.709 limited-range YUV to 8-bit RGB. HD video from Discord uses this matrix.
+pub(crate) fn yuv709_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
     let c = y - 16;
     let d = u - 128;
     let e = v - 128;
-    let r = (298 * c + 409 * e + 128) >> 8;
-    let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-    let b = (298 * c + 516 * d + 128) >> 8;
+    let r = (298 * c + 459 * e + 128) >> 8;
+    let g = (298 * c - 55 * d - 136 * e + 128) >> 8;
+    let b = (298 * c + 541 * d + 128) >> 8;
     (clamp_u8(b), clamp_u8(g), clamp_u8(r))
+}
+
+/// Chroma at one luma pixel. `ss_x` and `ss_y` are 0 (full) or 1 (half).
+pub(crate) fn chroma_bilinear(x: usize, y: usize, ss_x: u32, ss_y: u32, cw: usize, ch: usize, mut sample: impl FnMut(usize, usize) -> i32) -> i32 {
+    if cw == 0 || ch == 0 {
+        return 128;
+    }
+    let (cx, fx) = chroma_phase(x, ss_x, cw);
+    let (cy, fy) = chroma_phase(y, ss_y, ch);
+    let cx1 = (cx + 1).min(cw - 1);
+    let cy1 = (cy + 1).min(ch - 1);
+    let top = sample(cx, cy) * (256 - fx) + sample(cx1, cy) * fx;
+    let bottom = sample(cx, cy1) * (256 - fx) + sample(cx1, cy1) * fx;
+    (top * (256 - fy) + bottom * fy + (1 << 15)) >> 16
+}
+
+fn chroma_phase(pos: usize, ss: u32, limit: usize) -> (usize, i32) {
+    if ss == 0 || limit <= 1 {
+        return (pos.min(limit.saturating_sub(1)), 0);
+    }
+    // MPEG siting: the chroma sample sits between luma pixels.
+    let mut fp = pos as i32 * 128 + 64 - 128;
+    if fp < 0 {
+        fp = 0;
+    }
+    let max = ((limit as i32) - 1) << 8;
+    if fp > max {
+        fp = max;
+    }
+    ((fp >> 8) as usize, fp & 255)
 }
 
 fn clamp_u8(value: i32) -> u8 {
@@ -363,7 +400,7 @@ mod tests {
 
     #[test]
     fn yuv_black_is_dark() {
-        let (b, g, r) = yuv_to_rgb(16, 128, 128);
+        let (b, g, r) = yuv709_to_rgb(16, 128, 128);
         assert!(b < 8 && g < 8 && r < 8);
     }
 

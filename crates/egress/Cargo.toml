@@ -15,6 +15,7 @@ cpal = "0.15"
 grafton-ndi = { workspace = true, optional = true }
 openmediatransport = { workspace = true }
 thiserror = { workspace = true }
+vmx = { package = "vmx1", version = "0.1.0" }
 tracing = { workspace = true }
 
 [[bin]]

@@ -11,7 +11,7 @@ use rav1d::src::lib::{dav1d_close, dav1d_data_unref, dav1d_data_wrap, dav1d_defa
 use rav1d::src::send_sync_non_null::SendSyncNonNull;
 
 use crate::av1_ipc::{read_message, write_message, Av1IpcError, Message, FLAG_ABORT, FLAG_BAD_ID, FLAG_HANG, KIND_DECODE, KIND_DECODE_ERROR, KIND_DROP, KIND_HELLO, KIND_NO_PICTURE, KIND_PICTURE, KIND_READY, KIND_RESET, MAX_HEIGHT, MAX_WIDTH, WORKER_ARG};
-use crate::decode::DecodeError;
+use crate::decode::{chroma_bilinear, yuv709_to_rgb, DecodeError};
 
 pub fn maybe_run_av1_worker() -> bool {
     if std::env::args().nth(1).as_deref() != Some(WORKER_ARG) {
@@ -234,6 +234,8 @@ fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, D
     let u = picture.data[1];
     let v = picture.data[2];
     let stride_uv = picture.stride[1];
+    let cw = if ss_x == 0 { width } else { (width >> ss_x).max(1) };
+    let ch = if ss_y == 0 { height } else { (height >> ss_y).max(1) };
     let mut bgra = vec![0u8; width * height * 4];
     for row in 0..height {
         for col in 0..width {
@@ -244,11 +246,15 @@ fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, D
                 let Some(u) = u else { return Err(DecodeError::Av1("picture has no chroma".into())); };
                 let Some(v) = v else { return Err(DecodeError::Av1("picture has no chroma".into())); };
                 (
-                    plane_sample(u.as_ptr(), stride_uv, col >> ss_x, row >> ss_y, bpc) as i32,
-                    plane_sample(v.as_ptr(), stride_uv, col >> ss_x, row >> ss_y, bpc) as i32,
+                    chroma_bilinear(col, row, ss_x as u32, ss_y as u32, cw, ch, |x, y| {
+                        plane_sample(u.as_ptr(), stride_uv, x, y, bpc) as i32
+                    }),
+                    chroma_bilinear(col, row, ss_x as u32, ss_y as u32, cw, ch, |x, y| {
+                        plane_sample(v.as_ptr(), stride_uv, x, y, bpc) as i32
+                    }),
                 )
             };
-            let (b, g, r) = yuv_to_rgb(y_value, u_value, v_value);
+            let (b, g, r) = yuv709_to_rgb(y_value, u_value, v_value);
             let offset = (row * width + col) * 4;
             bgra[offset] = b;
             bgra[offset + 1] = g;
@@ -264,21 +270,8 @@ fn plane_sample(data: *const c_void, stride: isize, x: usize, y: usize, bpc: usi
     if bpc <= 8 {
         unsafe { *row.add(x) }
     } else {
-        let sample = unsafe { *(row as *const u16).add(x) };
-        (sample >> (bpc - 8)) as u8
+        let sample = unsafe { *(row as *const u16).add(x) } as u32;
+        let shift = bpc - 8;
+        ((sample + (1 << (shift - 1))) >> shift).min(255) as u8
     }
-}
-
-fn yuv_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
-    let c = y - 16;
-    let d = u - 128;
-    let e = v - 128;
-    let r = (298 * c + 409 * e + 128) >> 8;
-    let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-    let b = (298 * c + 516 * d + 128) >> 8;
-    (clamp_u8(b), clamp_u8(g), clamp_u8(r))
-}
-
-fn clamp_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
 }

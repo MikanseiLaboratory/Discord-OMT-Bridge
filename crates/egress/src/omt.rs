@@ -22,6 +22,8 @@ pub struct OmtPublisher {
     poll: Option<JoinHandle<()>>,
     last_discard_log: Option<Instant>,
     receiver_logged: bool,
+    /// VMX high-quality profile. A receiver's quality request must not lower this.
+    video_encoder: HqEncoder,
 }
 
 impl OmtPublisher {
@@ -77,6 +79,7 @@ impl OmtPublisher {
             poll: Some(poll),
             last_discard_log: None,
             receiver_logged: false,
+            video_encoder: HqEncoder::new(),
         })
     }
 }
@@ -110,9 +113,18 @@ impl VideoPublisher for OmtPublisher {
         if bgra.len() < expected || width == 0 || height == 0 {
             return Err(EgressError::InvalidFrame("BGRA buffer does not match dimensions"));
         }
+        let subscribed = self
+            .sender
+            .lock()
+            .map_err(|_| EgressError::Omt("sender lock poisoned".into()))?
+            .video_subscribed();
+        if !subscribed {
+            return Ok(());
+        }
+        let bitstream = self.video_encoder.encode(&bgra[..expected], width, height)?;
         let frame = MediaFrame {
             frame_type: VIDEO,
-            codec: Codec::Bgra.as_i32(),
+            codec: Codec::Vmx1.as_i32(),
             width: width as i32,
             height: height as i32,
             stride: (width * 4) as i32,
@@ -121,7 +133,7 @@ impl VideoPublisher for OmtPublisher {
             aspect_ratio: width as f32 / height as f32,
             color_space: ColorSpace::Bt709,
             timestamp: timestamp_100ns(),
-            data: bgra[..expected].to_vec(),
+            data: bitstream,
             ..MediaFrame::default()
         };
         let mut sender = self
@@ -191,6 +203,77 @@ impl AudioPublisher for OmtPublisher {
             tracing::info!(name = %self.name, peers, "OMT audio receiver connected");
         }
         Ok(())
+    }
+}
+
+/// Encodes BGRA with VMX profile Hq and sends the bitstream unchanged.
+/// The OMT sender's default follows a receiver's quality request, and that
+/// request can switch to a profile that compresses harder.
+struct HqEncoder {
+    codec: Option<vmx::Codec>,
+    width: i32,
+    height: i32,
+    buf: Vec<u8>,
+}
+
+impl HqEncoder {
+    fn new() -> Self {
+        Self {
+            codec: None,
+            width: 0,
+            height: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    fn encode(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, EgressError> {
+        let width = width as i32;
+        let height = height as i32;
+        if width < 16 || height < 16 {
+            return Err(EgressError::InvalidFrame("video frame is smaller than 16 pixels"));
+        }
+        if self.codec.is_none() || self.width != width || self.height != height {
+            self.codec = Some(
+                vmx::Codec::new(vmx::Config {
+                    width,
+                    height,
+                    profile: vmx::Profile::Hq,
+                    color_space: vmx::ColorSpace::Bt709,
+                })
+                .map_err(|err| EgressError::Omt(err.to_string()))?,
+            );
+            self.width = width;
+            self.height = height;
+            tracing::info!(width, height, "OMT video encoder is using the high-quality profile");
+        }
+        let codec = self.codec.as_mut().expect("codec after create");
+        codec
+            .encode_bgrx(bgra, (width as usize).saturating_mul(4))
+            .map_err(|err| EgressError::Omt(err.to_string()))?;
+        let need = (width as usize).saturating_mul(height as usize).saturating_mul(2).max(1 << 20);
+        if self.buf.len() < need {
+            self.buf.resize(need, 0);
+        }
+        let written = loop {
+            match codec.save_to(&mut self.buf) {
+                Ok(written) => break written,
+                Err(vmx::VmxError::OutputTooSmall { need, .. }) => {
+                    if need <= self.buf.len() {
+                        return Err(EgressError::Omt("VMX output buffer could not grow".into()));
+                    }
+                    self.buf.resize(need, 0);
+                }
+                Err(vmx::VmxError::BufferOverflow) => {
+                    let next = self.buf.len().saturating_mul(2).max(self.buf.len().saturating_add(1 << 20));
+                    if next <= self.buf.len() || next > 256 << 20 {
+                        return Err(EgressError::Omt("VMX output buffer could not grow".into()));
+                    }
+                    self.buf.resize(next, 0);
+                }
+                Err(err) => return Err(EgressError::Omt(err.to_string())),
+            }
+        };
+        Ok(self.buf[..written].to_vec())
     }
 }
 
