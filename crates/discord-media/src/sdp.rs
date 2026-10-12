@@ -22,6 +22,14 @@ pub fn select_protocol_fragment(local_sdp: &str, vp8_rtx_payload: Option<u8>) ->
     kept.join("\n")
 }
 
+fn video_bitrate_line(kind: &str, line: &str) -> String {
+    if kind == "video" && line.starts_with("a=fmtp:") && !line.contains("apt=") && !line.contains("x-google-max-bitrate=") {
+        format!("{line};x-google-max-bitrate={VIDEO_MAX_BITRATE_KBPS}")
+    } else {
+        line.to_owned()
+    }
+}
+
 fn rtpmap_is(line: &str, codec: &str) -> bool {
     let Some(rest) = line.strip_prefix("a=rtpmap:") else {
         return false;
@@ -154,7 +162,11 @@ struct OfferedSection {
     mid: String,
     direction: String,
     payloads: Vec<String>,
+    extmaps: Vec<String>,
 }
+
+/// kbps. The official client advertises about 9 Mbps for a source-quality video stream.
+const VIDEO_MAX_BITRATE_KBPS: u32 = 9000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssignedSsrc {
@@ -183,6 +195,9 @@ pub fn synthesize_answer(
     out.push_str("t=0 0\r\n");
     out.push_str(&format!("a=group:BUNDLE {}\r\n", mids.join(" ")));
     out.push_str("a=msid-semantic: WMS *\r\n");
+    if local_offer.lines().any(|line| line.trim() == "a=extmap-allow-mixed") {
+        out.push_str("a=extmap-allow-mixed\r\n");
+    }
     out.push_str(&format!("a=ice-ufrag:{}\r\n", transport.ice_ufrag));
     out.push_str(&format!("a=ice-pwd:{}\r\n", transport.ice_pwd));
     out.push_str(&format!("a=fingerprint:{}\r\n", transport.fingerprint));
@@ -231,7 +246,12 @@ pub fn synthesize_answer(
             answer_direction(&section.direction, video_stream.is_some())
         };
         out.push_str(&format!("a={direction}\r\n"));
+        for extmap in &section.extmaps {
+            out.push_str(extmap);
+            out.push_str("\r\n");
+        }
         let mut copied_fmtp = false;
+        let mut video_fmtp = Vec::new();
         for line in local_offer.lines() {
             let line = line.trim();
             if line.starts_with("a=rtpmap:") || line.starts_with("a=fmtp:") || line.starts_with("a=rtcp-fb:") {
@@ -243,10 +263,26 @@ pub fn synthesize_answer(
                 {
                     if line.starts_with("a=fmtp:") {
                         copied_fmtp = true;
+                        if section.kind == "video" {
+                            if let Some(payload) = line.strip_prefix("a=fmtp:").and_then(|rest| rest.split([' ', ';']).next()) {
+                                video_fmtp.push(payload.to_owned());
+                            }
+                        }
                     }
-                    out.push_str(line);
+                    let boosted = video_bitrate_line(&section.kind, line);
+                    out.push_str(&boosted);
                     out.push_str("\r\n");
                 }
+            }
+        }
+        if section.kind == "video" {
+            for payload in &section.payloads {
+                let already = video_fmtp.iter().any(|written| written == payload);
+                let rtx = local_offer.lines().any(|line| line.trim().starts_with(&format!("a=rtpmap:{payload} rtx/")));
+                if already || rtx {
+                    continue;
+                }
+                out.push_str(&format!("a=fmtp:{payload} x-google-max-bitrate={VIDEO_MAX_BITRATE_KBPS}\r\n"));
             }
         }
         if section.kind == "audio" {
@@ -313,12 +349,15 @@ fn offered_sections(sdp: &str) -> Vec<OfferedSection> {
                 mid: sections.len().to_string(),
                 direction: "recvonly".into(),
                 payloads: parts.map(str::to_owned).collect(),
+                extmaps: Vec::new(),
             });
         } else if let Some(section) = current.as_mut() {
             if let Some(mid) = line.strip_prefix("a=mid:") {
                 section.mid = mid.to_owned();
             } else if matches!(line, "a=recvonly" | "a=sendonly" | "a=sendrecv" | "a=inactive") {
                 section.direction = line.trim_start_matches("a=").to_owned();
+            } else if line.starts_with("a=extmap:") {
+                section.extmaps.push(line.to_owned());
             }
         }
     }
@@ -337,6 +376,7 @@ v=0\r
 o=- 0 0 IN IP4 127.0.0.1\r
 s=-\r
 t=0 0\r
+a=extmap-allow-mixed\r
 m=audio 9 UDP/TLS/RTP/SAVPF 111\r
 a=mid:0\r
 a=recvonly\r
@@ -349,8 +389,10 @@ m=video 9 UDP/TLS/RTP/SAVPF 102 103\r
 a=mid:1\r
 a=recvonly\r
 a=rtpmap:102 H264/90000\r
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r
 a=fmtp:103 apt=102\r
 a=rtpmap:103 rtx/90000\r
+a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r
 a=rtpmap:96 VP8/90000\r
 ";
 
@@ -390,10 +432,18 @@ c=IN IP4 127.0.0.1\r
         let audio = answer.split("m=video").next().unwrap_or("");
         assert!(audio.contains("a=sendonly"));
         assert!(audio.contains("a=ssrc:11 cname:a1-11"));
+        assert!(audio.contains("a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level"));
+        assert!(!audio.contains("transport-wide-cc"));
         assert!(!audio.contains("a=ssrc:22"));
         assert!(!audio.contains("a=inactive"));
         let video = answer.split("m=video").nth(1).unwrap_or("");
         assert!(video.contains("a=sendonly"));
+        assert!(video.contains("a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"));
+        assert!(!video.contains("ssrc-audio-level"));
+        assert!(video.contains("a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f;x-google-max-bitrate=9000"));
+        assert!(video.contains("a=fmtp:103 apt=102"));
+        assert!(!video.contains("apt=102;x-google-max-bitrate"));
+        assert!(answer.contains("a=extmap-allow-mixed"));
         assert!(answer.contains("a=setup:passive"));
         assert!(answer.contains("a=ice-ufrag:remote"));
         let media = answer.split_once("m=").map(|(_, rest)| rest).unwrap_or("");

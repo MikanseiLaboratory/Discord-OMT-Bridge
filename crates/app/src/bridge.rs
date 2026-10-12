@@ -316,6 +316,7 @@ struct MediaState {
     streams: HashMap<String, MediaHandle>,
     stream_endpoints: HashMap<String, StreamEndpoint>,
     stream_retry: HashMap<String, Instant>,
+    golive_misses: HashMap<String, u8>,
     queue: VecDeque<(u64, u64)>,
     awaiting: Option<(u64, u64)>,
     focused: Option<(u64, u64)>,
@@ -355,6 +356,7 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
         streams: HashMap::new(),
         stream_endpoints: HashMap::new(),
         stream_retry: HashMap::new(),
+        golive_misses: HashMap::new(),
         queue: VecDeque::new(),
         awaiting: None,
         focused: None,
@@ -602,10 +604,17 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                         apply_media(&session.config, &mut router, self_id, channel_id, MediaKind::Voice, &event);
                     }
                     Bus::Stream { key, event } => {
+                        if matches!(event, MediaEvent::Video { .. }) {
+                            media.golive_misses.remove(&key);
+                        }
                         let mut rewatch = false;
                         if let MediaEvent::Disconnected { reason } = &event {
                             world.last_error = Some(reason.clone());
                             rewatch = media.streams.remove(&key).is_some();
+                            if reason.contains("video did not arrive") {
+                                let misses = media.golive_misses.entry(key.clone()).or_insert(0);
+                                *misses = misses.saturating_add(1);
+                            }
                         }
                         if rewatch {
                             let due = media
@@ -615,7 +624,7 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                             if due {
                                 media.stream_retry.insert(key.clone(), Instant::now());
                                 if let Some(endpoint) = media.stream_endpoints.get(&key).cloned() {
-                                    if let Some(handle) = open_stream(&session.config, self_id, &mut media, endpoint, bus_tx.clone()) {
+                                    if let Some(handle) = open_stream(&session.config, self_id, &media, endpoint, bus_tx.clone()) {
                                         media.streams.insert(key.clone(), handle);
                                     }
                                 }
@@ -1033,7 +1042,7 @@ async fn handle_gateway(
                 return Ok(());
             };
             let key = endpoint.stream_key.clone();
-            let handle = start_stream(config, *self_id, channel_id, &session_id, endpoint, bus_tx.clone());
+            let handle = start_stream(config, *self_id, channel_id, &session_id, endpoint, bus_tx.clone(), golive_should_restart(media, &key));
             media.streams.insert(key, handle);
         }
         GatewayEvent::StreamUpdated { stream_key, paused } => {
@@ -1183,6 +1192,7 @@ fn start_voice(
         kind: MediaKind::Voice,
         max_video_slots: config.max_video_slots,
         prefer_quality: 100,
+        restart_if_video_missing: false,
     });
     forward_media(handle, bus_tx, VoiceRoute::Channel(channel_id))
 }
@@ -1200,7 +1210,12 @@ fn open_stream(
         .iter()
         .find(|seat| seat.guild_id == guild_id && seat.channel_id == channel_id && !seat.session_id.is_empty())
         .map(|seat| seat.session_id.clone())?;
-    Some(start_stream(config, self_id, channel_id, &session_id, endpoint, bus_tx))
+    let restart = golive_should_restart(media, &endpoint.stream_key);
+    Some(start_stream(config, self_id, channel_id, &session_id, endpoint, bus_tx, restart))
+}
+
+fn golive_should_restart(media: &MediaState, key: &str) -> bool {
+    media.golive_misses.get(key).copied().unwrap_or(0) < 3
 }
 
 fn start_stream(
@@ -1210,6 +1225,7 @@ fn start_stream(
     voice_session_id: &str,
     endpoint: StreamEndpoint,
     bus_tx: mpsc::Sender<Bus>,
+    restart_if_video_missing: bool,
 ) -> MediaHandle {
     let key = endpoint.stream_key.clone();
     let handle = spawn_media(ConnectParams {
@@ -1222,6 +1238,7 @@ fn start_stream(
         kind: MediaKind::GoLive,
         max_video_slots: config.max_video_slots,
         prefer_quality: 100,
+        restart_if_video_missing,
     });
     tracing::info!(stream_key = %key, user_id = endpoint.user_id, "watching Go Live");
     forward_media(handle, bus_tx, VoiceRoute::Stream(key))

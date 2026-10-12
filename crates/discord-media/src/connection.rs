@@ -49,6 +49,8 @@ pub struct ConnectParams {
     pub kind: MediaKind,
     pub max_video_slots: usize,
     pub prefer_quality: u32,
+    /// A Go Live connection with no video RTP closes so the watcher can start again.
+    pub restart_if_video_missing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +207,6 @@ async fn run_connection(
     let mut answer_tick = interval(Duration::from_millis(200));
     answer_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut video_since: Option<Instant> = None;
-    let mut resubscribed = false;
     let mut logged_receivers = false;
     let mut seen_ops: HashMap<u64, u8> = HashMap::new();
 
@@ -237,15 +238,18 @@ async fn run_connection(
                         logged_receivers = true;
                         log_armed_receivers(&peer).await;
                     }
+                    // A keyframe request before any video packet can make the stream
+                    // server keep the audio and drop the picture. Ask once after the
+                    // peer is up. If the picture still never arrives, start again.
                     let missing_video = params.kind == MediaKind::GoLive
+                        && params.restart_if_video_missing
                         && video_rtp == 0
                         && video_streams.iter().any(|stream| stream.ssrc != 0);
                     if missing_video {
                         if let Some(start) = video_since {
-                            if !resubscribed && start.elapsed() >= Duration::from_secs(2) {
-                                resubscribed = true;
-                                request_pli = true;
-                                tracing::info!("resubscribing Go Live video");
+                            if start.elapsed() >= Duration::from_secs(5) {
+                                tracing::warn!("Go Live video did not arrive; reconnecting");
+                                return Err(MediaError::Voice("Go Live video did not arrive".into()));
                             }
                         }
                     }
@@ -258,11 +262,10 @@ async fn run_connection(
                     // the exception: that SSRC stays blocked until a sequence
                     // header arrives, so keep asking only for the stalled stream.
                     let recovering = !keyframe_wait.is_empty();
-                    if ready && recovering && keyframe_requests % 5 == 0 {
+                    if ready && recovering && video_rtp > 0 && keyframe_requests % 5 == 0 {
                         request_pli = true;
                     }
-                    let ask_keyframe = ready
-                        && (request_pli || keyframe_requests <= 3 || (video_rtp == 0 && keyframe_requests % 5 == 0));
+                    let ask_keyframe = ready && request_pli;
                     if ask_keyframe {
                         request_pli = false;
                         let sender_ssrc = local_audio_ssrc.max(1);
@@ -278,7 +281,7 @@ async fn run_connection(
                                 tracing::warn!(%err, ssrc = media_ssrc, "PLI was not sent");
                             }
                         }
-                        if keyframe_requests <= 20 || (recovering && keyframe_requests % 25 == 0) || (resubscribed && video_rtp == 0) {
+                        if keyframe_requests <= 20 || (recovering && keyframe_requests % 25 == 0) {
                             tracing::info!(streams = video_streams.len(), sender_ssrc, recovering, "requested video keyframe");
                         }
                     }
@@ -1463,7 +1466,7 @@ fn register_discord_payloads(media: &mut MediaEngine) -> Result<(), MediaError> 
                     mime_type: "video/AV1".to_owned(),
                     clock_rate: 90_000,
                     channels: 0,
-                    sdp_fmtp_line: String::new(),
+                    sdp_fmtp_line: "profile=0;level-idx=12;tier=0;x-google-max-bitrate=9000".to_owned(),
                     rtcp_feedback: Vec::new(),
                 },
                 payload_type: 101,
@@ -1480,7 +1483,7 @@ fn register_discord_payloads(media: &mut MediaEngine) -> Result<(), MediaError> 
                         mime_type: MIME_TYPE_H264.to_owned(),
                         clock_rate: 90_000,
                         channels: 0,
-                        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+                        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f;x-google-max-bitrate=9000".to_owned(),
                         rtcp_feedback: Vec::new(),
                     },
                     payload_type,
