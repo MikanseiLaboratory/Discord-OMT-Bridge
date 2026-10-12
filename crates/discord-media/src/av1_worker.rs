@@ -11,7 +11,7 @@ use rav1d::src::lib::{dav1d_close, dav1d_data_unref, dav1d_data_wrap, dav1d_defa
 use rav1d::src::send_sync_non_null::SendSyncNonNull;
 
 use crate::av1_ipc::{read_message, write_message, Av1IpcError, Message, FLAG_ABORT, FLAG_BAD_ID, FLAG_HANG, KIND_DECODE, KIND_DECODE_ERROR, KIND_DROP, KIND_HELLO, KIND_NO_PICTURE, KIND_PICTURE, KIND_READY, KIND_RESET, MAX_HEIGHT, MAX_WIDTH, WORKER_ARG};
-use crate::decode::{chroma_bilinear, yuv709_to_rgb, DecodeError};
+use crate::decode::{chroma_bilinear, yuv_to_rgb, YuvColor, DecodeError};
 
 pub fn maybe_run_av1_worker() -> bool {
     if std::env::args().nth(1).as_deref() != Some(WORKER_ARG) {
@@ -236,6 +236,7 @@ fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, D
     let stride_uv = picture.stride[1];
     let cw = if ss_x == 0 { width } else { (width >> ss_x).max(1) };
     let ch = if ss_y == 0 { height } else { (height >> ss_y).max(1) };
+    let color = picture_color(picture);
     let mut bgra = vec![0u8; width * height * 4];
     for row in 0..height {
         for col in 0..width {
@@ -254,7 +255,7 @@ fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, D
                     }),
                 )
             };
-            let (b, g, r) = yuv709_to_rgb(y_value, u_value, v_value);
+            let (b, g, r) = yuv_to_rgb(color, y_value, u_value, v_value);
             let offset = (row * width + col) * 4;
             bgra[offset] = b;
             bgra[offset + 1] = g;
@@ -263,6 +264,15 @@ fn picture_bgra(picture: &Dav1dPicture) -> Result<Option<(Vec<u8>, u32, u32)>, D
         }
     }
     Ok(Some((bgra, width as u32, height as u32)))
+}
+
+fn picture_color(picture: &Dav1dPicture) -> YuvColor {
+    let Some(header) = picture.seq_hdr else {
+        return YuvColor::hd_limited();
+    };
+    // The sequence header stays alive until dav1d_picture_unref.
+    let header = unsafe { header.as_ref() };
+    YuvColor::from_av1(header.mtrx, header.color_range)
 }
 
 fn plane_sample(data: *const c_void, stride: isize, x: usize, y: usize, bpc: usize) -> u8 {

@@ -309,7 +309,7 @@ fn yuv_to_bgra(yuv: &impl YUVSource) -> Vec<u8> {
             let v = chroma_bilinear(col, row, 1, 1, cw, ch, |x, y| {
                 v_plane.get(y * v_stride + x).copied().unwrap_or(128) as i32
             });
-            let (b, g, r) = yuv709_to_rgb(y, u, v);
+            let (b, g, r) = yuv_to_rgb(YuvColor::hd_limited(), y, u, v);
             let offset = (row * width + col) * 4;
             bgra[offset] = b;
             bgra[offset + 1] = g;
@@ -320,14 +320,82 @@ fn yuv_to_bgra(yuv: &impl YUVSource) -> Vec<u8> {
     bgra
 }
 
-/// BT.709 limited-range YUV to 8-bit RGB. HD video from Discord uses this matrix.
-pub(crate) fn yuv709_to_rgb(y: i32, u: i32, v: i32) -> (u8, u8, u8) {
-    let c = y - 16;
+/// Color description from an AV1 sequence header. Unknown values stay on
+/// limited-range BT.709, which is what ordinary Discord HD uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct YuvColor {
+    matrix: YuvMatrix,
+    full: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YuvMatrix {
+    Bt709,
+    Bt601,
+    Bt2020,
+    Identity,
+}
+
+impl YuvColor {
+    pub(crate) fn hd_limited() -> Self {
+        Self {
+            matrix: YuvMatrix::Bt709,
+            full: false,
+        }
+    }
+
+    pub(crate) fn from_av1(matrix: u32, color_range: u8) -> Self {
+        let matrix = match matrix {
+            0 => YuvMatrix::Identity,
+            4 | 5 | 6 => YuvMatrix::Bt601,
+            9 => YuvMatrix::Bt2020,
+            _ => YuvMatrix::Bt709,
+        };
+        Self {
+            matrix,
+            full: color_range == 1,
+        }
+    }
+}
+
+pub(crate) fn yuv_to_rgb(color: YuvColor, y: i32, u: i32, v: i32) -> (u8, u8, u8) {
+    if color.matrix == YuvMatrix::Identity {
+        let plane = |sample: i32| {
+            if color.full {
+                sample
+            } else {
+                ((sample - 16) * 298 + 128) >> 8
+            }
+        };
+        // AV1 identity stores G in Y, B in U, and R in V.
+        return (clamp_u8(plane(u)), clamp_u8(plane(y)), clamp_u8(plane(v)));
+    }
     let d = u - 128;
     let e = v - 128;
-    let r = (298 * c + 459 * e + 128) >> 8;
-    let g = (298 * c - 55 * d - 136 * e + 128) >> 8;
-    let b = (298 * c + 541 * d + 128) >> 8;
+    let (r, g, b) = if color.full {
+        let (re, gd, ge, bd) = match color.matrix {
+            YuvMatrix::Bt601 => (359, 88, 183, 454),
+            YuvMatrix::Bt2020 => (378, 42, 146, 482),
+            YuvMatrix::Bt709 | YuvMatrix::Identity => (403, 48, 120, 475),
+        };
+        (
+            y + ((re * e + 128) >> 8),
+            y - ((gd * d + ge * e + 128) >> 8),
+            y + ((bd * d + 128) >> 8),
+        )
+    } else {
+        let c = y - 16;
+        let (re, gd, ge, bd) = match color.matrix {
+            YuvMatrix::Bt601 => (409, 100, 208, 516),
+            YuvMatrix::Bt2020 => (430, 48, 167, 548),
+            YuvMatrix::Bt709 | YuvMatrix::Identity => (459, 55, 136, 541),
+        };
+        (
+            (298 * c + re * e + 128) >> 8,
+            (298 * c - gd * d - ge * e + 128) >> 8,
+            (298 * c + bd * d + 128) >> 8,
+        )
+    };
     (clamp_u8(b), clamp_u8(g), clamp_u8(r))
 }
 
@@ -400,8 +468,38 @@ mod tests {
 
     #[test]
     fn yuv_black_is_dark() {
-        let (b, g, r) = yuv709_to_rgb(16, 128, 128);
+        let (b, g, r) = yuv_to_rgb(YuvColor::hd_limited(), 16, 128, 128);
         assert!(b < 8 && g < 8 && r < 8);
+    }
+
+    #[test]
+    fn full_range_gray_is_not_lifted_to_limited_black() {
+        let (b, g, r) = yuv_to_rgb(YuvColor::from_av1(1, 1), 16, 128, 128);
+        assert!((12..=20).contains(&b) && (12..=20).contains(&g) && (12..=20).contains(&r));
+    }
+
+    #[test]
+    fn av1_color_description_selects_the_matrix() {
+        assert_eq!(YuvColor::from_av1(2, 0), YuvColor::hd_limited());
+        assert_eq!(
+            YuvColor::from_av1(6, 0),
+            YuvColor {
+                matrix: YuvMatrix::Bt601,
+                full: false
+            }
+        );
+        assert_eq!(
+            YuvColor::from_av1(9, 1),
+            YuvColor {
+                matrix: YuvMatrix::Bt2020,
+                full: true
+            }
+        );
+        let (b, g, r) = yuv_to_rgb(YuvColor::from_av1(0, 1), 10, 20, 30);
+        assert_eq!((b, g, r), (20, 10, 30));
+        let hd = yuv_to_rgb(YuvColor::hd_limited(), 126, 90, 200);
+        let sd = yuv_to_rgb(YuvColor::from_av1(6, 0), 126, 90, 200);
+        assert_ne!(hd, sd);
     }
 
     #[test]

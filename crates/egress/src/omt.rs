@@ -230,7 +230,7 @@ impl HqEncoder {
             codec: None,
             width: 0,
             height: 0,
-            quality: 80,
+            quality: 99,
             buf: Vec::new(),
         }
     }
@@ -255,7 +255,7 @@ impl HqEncoder {
             );
             self.width = width;
             self.height = height;
-            self.quality = 80;
+            self.quality = 99;
             tracing::info!(
                 width,
                 height,

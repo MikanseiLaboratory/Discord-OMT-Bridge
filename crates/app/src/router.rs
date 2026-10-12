@@ -150,6 +150,7 @@ struct OutputSlot {
     fps: f64,
     width: u32,
     height: u32,
+    video_rate: (u32, u32),
     idle_video: Vec<u8>,
 }
 
@@ -324,11 +325,15 @@ impl SourceRouter {
             }
             self.slots[index].width = width;
             self.slots[index].height = height;
+            self.slots[index].video_rate = frame_rate;
             let idle_len = (width as usize)
                 .saturating_mul(height as usize)
                 .saturating_mul(4);
             if self.slots[index].idle_video.len() != idle_len {
                 self.slots[index].idle_video.resize(idle_len, 0);
+            }
+            if bgra.len() >= idle_len {
+                self.slots[index].idle_video[..idle_len].copy_from_slice(&bgra[..idle_len]);
             }
             let result = match &mut self.slots[index].outlet {
                 Outlet::Network(publisher) => publisher
@@ -417,6 +422,7 @@ impl SourceRouter {
             fps: 0.0,
             width: 640,
             height: 360,
+            video_rate: (0, 1),
             idle_video: vec![0; 640 * 360 * 4],
         });
         Ok(())
@@ -662,8 +668,12 @@ impl SourceRouter {
                     let _ = publisher.publish_audio(&self.silence, 48_000, 2);
                 }
                 if video {
-                    let _ =
-                        publisher.publish_video(&slot.idle_video, slot.width, slot.height, (1, 1));
+                    let rate = if slot.video_rate.0 == 0 {
+                        (1, 1)
+                    } else {
+                        slot.video_rate
+                    };
+                    let _ = publisher.publish_video(&slot.idle_video, slot.width, slot.height, rate);
                 }
             }
             slot.last_output = Instant::now();

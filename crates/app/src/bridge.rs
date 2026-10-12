@@ -645,9 +645,11 @@ async fn run_session(mut session: Session) -> anyhow::Result<()> {
                                 .stream_retry
                                 .get(&key)
                                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
-                            let misses = media.golive_misses.get(&key).copied().unwrap_or(0);
-                            // The 8s cooldown would skip the retry that this timeout just asked for.
-                            if due || (missing_video && misses <= 3) {
+                            // A stream server can accept audio while withholding its
+                            // video track. Keep retrying that specific timeout; after
+                            // three attempts the old cap left the output permanently
+                            // audio-only until a new gateway event arrived.
+                            if due || missing_video {
                                 media.stream_retry.insert(key.clone(), Instant::now());
                                 if let Some(endpoint) = media.stream_endpoints.get(&key).cloned() {
                                     if let Some(handle) = open_stream(&session.config, self_id, &media, endpoint, bus_tx.clone()) {
@@ -1377,8 +1379,8 @@ fn open_stream(
     ))
 }
 
-fn golive_should_restart(media: &MediaState, key: &str) -> bool {
-    media.golive_misses.get(key).copied().unwrap_or(0) < 3
+fn golive_should_restart(_media: &MediaState, _key: &str) -> bool {
+    true
 }
 
 fn start_stream(

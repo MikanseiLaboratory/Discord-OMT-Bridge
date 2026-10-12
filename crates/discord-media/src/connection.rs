@@ -233,7 +233,9 @@ async fn run_connection(
                     // A PLI before the first video packet makes the stream server
                     // keep Go Live audio and never open the video track. Ask only
                     // after a decoder is actually waiting on a keyframe.
-                    if ready && video_since.is_none() {
+                    // Start the clock when the answer is in place. A handshake that
+                    // never reaches Connected would otherwise wait forever.
+                    if video_since.is_none() {
                         video_since = Some(Instant::now());
                     }
                     if ready && !logged_receivers {
